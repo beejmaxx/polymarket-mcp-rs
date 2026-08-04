@@ -1,5 +1,10 @@
 use polymarket_mcp_rs::{App, PolymarketServer};
-use rmcp::{ServiceExt, model::CallToolRequestParams};
+use rmcp::{
+    ServiceExt,
+    model::CallToolRequestParams,
+    transport::{ConfigureCommandExt, TokioChildProcess},
+};
+use serde_json::json;
 
 #[tokio::test]
 async fn client_can_initialize_list_tools_and_call_offline_status() {
@@ -33,18 +38,13 @@ async fn client_can_initialize_list_tools_and_call_offline_status() {
     assert_eq!(
         names,
         [
+            "analyze_order_book",
             "analyze_wallet_risk",
-            "cancel_all_orders",
-            "cancel_market_orders",
-            "cancel_order",
             "compare_markets",
-            "get_balance_allowance",
             "get_event",
             "get_live_snapshot",
             "get_market",
             "get_market_holders",
-            "get_order",
-            "get_order_approval",
             "get_order_book",
             "get_price_history",
             "get_realtime_events",
@@ -53,24 +53,21 @@ async fn client_can_initialize_list_tools_and_call_offline_status() {
             "get_wallet_positions",
             "get_wallet_trades",
             "get_wallet_value",
-            "list_account_trades",
             "list_markets",
-            "list_open_orders",
             "list_recordings",
-            "place_batch_orders",
-            "place_order",
-            "preview_order",
+            "replay_events",
             "replay_market",
+            "scan_market_microstructure",
             "search_markets",
             "server_status",
             "simulate_order",
             "start_recording",
             "stop_recording",
             "stop_watching",
-            "trading_status",
             "watch_markets"
         ]
     );
+    assert!(!names.contains(&"place_order".to_owned()));
 
     let status = client
         .peer()
@@ -80,6 +77,60 @@ async fn client_can_initialize_list_tools_and_call_offline_status() {
     assert_eq!(status.is_error, Some(false));
     assert!(status.structured_content.is_some());
 
+    let invalid =
+        client
+            .peer()
+            .call_tool(CallToolRequestParams::new("search_markets").with_arguments(
+                serde_json::from_value(json!({"query": "   ", "limit": 3})).unwrap(),
+            ))
+            .await
+            .unwrap();
+    assert_eq!(invalid.is_error, Some(true));
+    let error = invalid.structured_content.expect("typed tool error");
+    assert_eq!(error["code"], "invalid_input");
+    assert_eq!(error["retryable"], false);
+
     client.cancel().await.unwrap();
     server_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn compiled_stdio_binary_initializes_and_serves_tools() {
+    let directory = tempfile::tempdir().unwrap();
+    let transport = TokioChildProcess::new(
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_polymarket-mcp-rs")).configure(
+            |command| {
+                command
+                    .current_dir(directory.path())
+                    .env("POLYMARKET_MCP_DB", directory.path().join("stdio.sqlite3"));
+            },
+        ),
+    )
+    .unwrap();
+    let client = ().serve(transport).await.unwrap();
+
+    let peer_info = client.peer().peer_info().expect("stdio server info");
+    assert_eq!(
+        peer_info
+            .server_info
+            .as_ref()
+            .map(|info| info.name.as_str()),
+        Some("polymarket-mcp-rs")
+    );
+    let tools = client.peer().list_tools(None).await.unwrap();
+    assert!(
+        tools
+            .tools
+            .iter()
+            .any(|tool| tool.name == "scan_market_microstructure")
+    );
+    assert!(!tools.tools.iter().any(|tool| tool.name == "place_order"));
+    let status = client
+        .peer()
+        .call_tool(CallToolRequestParams::new("server_status"))
+        .await
+        .unwrap();
+    assert_eq!(status.is_error, Some(false));
+
+    client.cancel().await.unwrap();
 }

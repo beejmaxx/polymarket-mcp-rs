@@ -6,7 +6,7 @@ The Rust server targets capability parity, not a one-for-one port of every Pytho
 |---|---|---|
 | Search, trending, featured, category, sports, crypto, closing-soon filters | `search_markets`, `list_markets` filters/sorting | Complete |
 | Event markets and details | `get_event` | Complete |
-| Market details, price, spread, liquidity, volume | `get_market` | Complete |
+| Market details, price, spread, liquidity, volume | `get_market`, `analyze_order_book`, `scan_market_microstructure` | Complete, with inspectable single- and multi-market L2 metrics |
 | Full current order book | `get_order_book` | Complete |
 | Price history | `get_price_history` | Complete, public CLOB endpoint |
 | Top holders | `get_market_holders` | Complete, public Data API |
@@ -31,4 +31,4 @@ The Rust server targets capability parity, not a one-for-one port of every Pytho
 
 Current Polymarket wallet modes are supported through configurable EOA, Proxy, Gnosis Safe, or POLY_1271 signatures and an optional/required funder address. Authenticated balance and allowance inspection is exposed through `get_balance_allowance`.
 
-Rust-only differentiation is concentrated in persistent concurrent book state, bounded internal fan-out, explicit feed health, dedicated SQLite writing, deterministic replay, exact decimal arithmetic, and a single distributable binary.
+Rust-only differentiation is concentrated in persistent concurrent book state, bounded multi-market scans, explicit feed health, dedicated SQLite book/event writing, deterministic replay, exact decimal arithmetic, generated MCP schemas, and a single distributable binary.

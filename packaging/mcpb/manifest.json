@@ -1,0 +1,59 @@
+{
+  "manifest_version": "0.3",
+  "name": "polymarket-mcp",
+  "display_name": "Polymarket MCP",
+  "version": "0.1.0",
+  "description": "Public Polymarket discovery, exact CLOB V2 books, realtime research, replay, simulation, and opt-in trading.",
+  "long_description": "A self-contained Rust MCP server for Polymarket. The default research profile requires no credentials and hides every authenticated trading tool. Exact financial values and 256-bit IDs are returned as strings. Optional trading uses a separate profile plus explicit enablement and confirmations.",
+  "author": {
+    "name": "beejmaxx",
+    "url": "https://github.com/beejmaxx"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/beejmaxx/polymarket-mcp-rs.git"
+  },
+  "homepage": "https://github.com/beejmaxx/polymarket-mcp-rs",
+  "documentation": "https://github.com/beejmaxx/polymarket-mcp-rs#readme",
+  "support": "https://github.com/beejmaxx/polymarket-mcp-rs/issues",
+  "server": {
+    "type": "binary",
+    "entry_point": "server/launch",
+    "mcp_config": {
+      "command": "${__dirname}/server/launch",
+      "args": [],
+      "env": {
+        "POLYMARKET_TOOL_PROFILE": "${user_config.tool_profile}",
+        "POLYMARKET_MCP_DB": "${HOME}/polymarket-mcp.sqlite3"
+      },
+      "platform_overrides": {
+        "win32": {
+          "command": "${__dirname}/server/polymarket-mcp-rs.exe"
+        }
+      }
+    }
+  },
+  "user_config": {
+    "tool_profile": {
+      "type": "string",
+      "title": "Tool profile",
+      "description": "research (recommended), core, trading, or all. Trading order mutations still require separate environment configuration.",
+      "default": "research",
+      "required": true
+    }
+  },
+  "tools": [
+    { "name": "search_markets", "description": "Search active Polymarket events and markets." },
+    { "name": "get_market", "description": "Get an enriched market and current outcome books." },
+    { "name": "scan_market_microstructure", "description": "Scan active markets for exact-decimal L2 metrics." },
+    { "name": "watch_markets", "description": "Maintain local realtime order books over WebSocket." },
+    { "name": "simulate_order", "description": "Estimate fills and slippage without placing an order." }
+  ],
+  "tools_generated": true,
+  "keywords": ["polymarket", "prediction-markets", "market-data", "order-book", "rust"],
+  "license": "MIT",
+  "privacy_policies": ["https://polymarket.com/privacy"],
+  "compatibility": {
+    "platforms": ["darwin", "win32", "linux"]
+  }
+}

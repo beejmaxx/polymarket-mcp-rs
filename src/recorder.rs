@@ -14,10 +14,10 @@ use tokio::sync::{Mutex, broadcast, mpsc, oneshot, watch};
 
 use crate::{
     error::AppError,
-    realtime::RealtimeUpdate,
+    realtime::{RealtimeEventUpdate, RealtimeUpdate},
     types::{
-        ListRecordingsOutput, LiveOrderBook, LiveSnapshotOutput, PriceLevel, RecordingInfo,
-        ReplayMarketOutput,
+        ListRecordingsOutput, LiveOrderBook, LiveSnapshotOutput, PriceLevel, RealtimeEvent,
+        RecordingInfo, ReplayEventsOutput, ReplayMarketOutput,
     },
 };
 
@@ -37,7 +37,9 @@ struct ActiveRecording {
 #[derive(Debug)]
 enum WriterCommand {
     Insert(Box<LiveOrderBook>),
-    Gap(u64),
+    InsertEvent(Box<RealtimeEvent>),
+    BookGap(u64),
+    EventGap(u64),
     Stop(u64, oneshot::Sender<Result<(), String>>),
 }
 
@@ -69,6 +71,7 @@ impl RecorderService {
         label: Option<String>,
         initial: LiveSnapshotOutput,
         mut updates: broadcast::Receiver<RealtimeUpdate>,
+        mut events: broadcast::Receiver<RealtimeEventUpdate>,
     ) -> Result<RecordingInfo, AppError> {
         let recording_id = format!(
             "recording-{}-{}",
@@ -130,7 +133,19 @@ impl RecorderService {
                             }
                             Ok(_) => {}
                             Err(broadcast::error::RecvError::Lagged(count)) => {
-                                let _ = task_writer.send(WriterCommand::Gap(count)).await;
+                                let _ = task_writer.send(WriterCommand::BookGap(count)).await;
+                            }
+                            Err(broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                    event = events.recv() => {
+                        match event {
+                            Ok(event) if event.watch_id == task_watch_id => {
+                                if task_writer.send(WriterCommand::InsertEvent(Box::new(event.event))).await.is_err() { break; }
+                            }
+                            Ok(_) => {}
+                            Err(broadcast::error::RecvError::Lagged(count)) => {
+                                let _ = task_writer.send(WriterCommand::EventGap(count)).await;
                             }
                             Err(broadcast::error::RecvError::Closed) => break,
                         }
@@ -152,6 +167,8 @@ impl RecorderService {
             stopped_at_ms: None,
             snapshot_count: 0,
             dropped_update_count: 0,
+            event_count: 0,
+            dropped_event_count: 0,
             writer_error_count: 0,
             last_writer_error: None,
             active: true,
@@ -177,11 +194,29 @@ impl RecorderService {
             .ok_or_else(|| AppError::InvalidInput(format!("unknown recording_id {recording_id}")))
     }
 
+    pub async fn stop_all(&self) -> Result<usize, AppError> {
+        let recording_ids = self.active.lock().await.keys().cloned().collect::<Vec<_>>();
+        let mut stopped = 0;
+        let mut first_error = None;
+        for recording_id in recording_ids {
+            match self.stop(&recording_id).await {
+                Ok(_) => stopped += 1,
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
+        }
+        if let Some(error) = first_error {
+            Err(error)
+        } else {
+            Ok(stopped)
+        }
+    }
+
     pub fn list(&self, limit: u16) -> Result<ListRecordingsOutput, AppError> {
         initialize(&self.path)?;
         let connection = Connection::open(&self.path).map_err(database_error)?;
         let mut statement = connection
-            .prepare("SELECT id, watch_id, label, token_ids_json, started_at_ms, stopped_at_ms, snapshot_count, dropped_update_count, writer_error_count, last_writer_error, active FROM recordings ORDER BY started_at_ms DESC LIMIT ?1")
+            .prepare("SELECT id, watch_id, label, token_ids_json, started_at_ms, stopped_at_ms, snapshot_count, dropped_update_count, event_count, dropped_event_count, writer_error_count, last_writer_error, active FROM recordings ORDER BY started_at_ms DESC LIMIT ?1")
             .map_err(database_error)?;
         let rows = statement
             .query_map([i64::from(limit)], recording_from_row)
@@ -249,12 +284,63 @@ impl RecorderService {
         })
     }
 
+    pub fn replay_events(
+        &self,
+        recording_id: &str,
+        after_sequence: u64,
+        start_ms: Option<i64>,
+        end_ms: Option<i64>,
+        limit: u32,
+    ) -> Result<ReplayEventsOutput, AppError> {
+        initialize(&self.path)?;
+        if self.recording(recording_id)?.is_none() {
+            return Err(AppError::InvalidInput(format!(
+                "unknown recording_id {recording_id}"
+            )));
+        }
+        let connection = Connection::open(&self.path).map_err(database_error)?;
+        let mut statement = connection
+            .prepare(
+                "SELECT payload_json FROM realtime_events WHERE recording_id = ?1 AND sequence > ?2 AND (?3 IS NULL OR timestamp_ms >= ?3) AND (?4 IS NULL OR timestamp_ms <= ?4) ORDER BY sequence, id LIMIT ?5",
+            )
+            .map_err(database_error)?;
+        let rows = statement
+            .query_map(
+                params![
+                    recording_id,
+                    as_i64(after_sequence),
+                    start_ms,
+                    end_ms,
+                    i64::from(limit)
+                ],
+                |row| {
+                    let payload: String = row.get(0)?;
+                    serde_json::from_str(&payload).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })
+                },
+            )
+            .map_err(database_error)?;
+        let events = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error)?;
+        Ok(ReplayEventsOutput {
+            recording_id: recording_id.to_owned(),
+            count: events.len(),
+            events,
+        })
+    }
+
     fn recording(&self, recording_id: &str) -> Result<Option<RecordingInfo>, AppError> {
         initialize(&self.path)?;
         let connection = Connection::open(&self.path).map_err(database_error)?;
         connection
             .query_row(
-                "SELECT id, watch_id, label, token_ids_json, started_at_ms, stopped_at_ms, snapshot_count, dropped_update_count, writer_error_count, last_writer_error, active FROM recordings WHERE id = ?1",
+                "SELECT id, watch_id, label, token_ids_json, started_at_ms, stopped_at_ms, snapshot_count, dropped_update_count, event_count, dropped_event_count, writer_error_count, last_writer_error, active FROM recordings WHERE id = ?1",
                 [recording_id],
                 recording_from_row,
             )
@@ -282,10 +368,24 @@ fn writer_loop(
     while let Some(command) = receiver.blocking_recv() {
         let (result, should_stop) = match command {
             WriterCommand::Insert(book) => (insert_book(&mut connection, recording_id, &book), false),
-            WriterCommand::Gap(count) => (
+            WriterCommand::InsertEvent(event) => (
+                insert_event(&mut connection, recording_id, &event),
+                false,
+            ),
+            WriterCommand::BookGap(count) => (
                 connection
                     .execute(
                         "UPDATE recordings SET dropped_update_count = dropped_update_count + ?2 WHERE id = ?1",
+                        params![recording_id, i64::try_from(count).unwrap_or(i64::MAX)],
+                    )
+                    .map(|_| ())
+                    .map_err(|error| error.to_string()),
+                false,
+            ),
+            WriterCommand::EventGap(count) => (
+                connection
+                    .execute(
+                        "UPDATE recordings SET dropped_event_count = dropped_event_count + ?2 WHERE id = ?1",
                         params![recording_id, i64::try_from(count).unwrap_or(i64::MAX)],
                     )
                     .map(|_| ())
@@ -340,6 +440,36 @@ fn insert_book(
     transaction.commit().map_err(|error| error.to_string())
 }
 
+fn insert_event(
+    connection: &mut Connection,
+    recording_id: &str,
+    event: &RealtimeEvent,
+) -> Result<(), String> {
+    let payload = serde_json::to_string(event).map_err(|error| error.to_string())?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "INSERT INTO realtime_events (recording_id, sequence, event_type, timestamp_ms, payload_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                recording_id,
+                as_i64(event.sequence),
+                event.event_type,
+                event.timestamp_ms,
+                payload
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "UPDATE recordings SET event_count = event_count + 1 WHERE id = ?1",
+            [recording_id],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())
+}
+
 fn initialize(path: &Path) -> Result<(), AppError> {
     let connection = Connection::open(path).map_err(database_error)?;
     connection
@@ -355,6 +485,8 @@ fn initialize(path: &Path) -> Result<(), AppError> {
                 stopped_at_ms INTEGER,
                 snapshot_count INTEGER NOT NULL DEFAULT 0,
                 dropped_update_count INTEGER NOT NULL DEFAULT 0,
+                event_count INTEGER NOT NULL DEFAULT 0,
+                dropped_event_count INTEGER NOT NULL DEFAULT 0,
                 writer_error_count INTEGER NOT NULL DEFAULT 0,
                 last_writer_error TEXT,
                 active INTEGER NOT NULL DEFAULT 1
@@ -375,9 +507,28 @@ fn initialize(path: &Path) -> Result<(), AppError> {
                 bids_json TEXT NOT NULL,
                 asks_json TEXT NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS realtime_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                recording_id TEXT NOT NULL REFERENCES recordings(id),
+                sequence INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                timestamp_ms INTEGER NOT NULL,
+                payload_json TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS realtime_events_replay ON realtime_events(recording_id, sequence, id);
              CREATE INDEX IF NOT EXISTS book_snapshots_replay ON book_snapshots(recording_id, token_id, upstream_timestamp_ms, id);",
         )
         .map_err(database_error)?;
+    ensure_column(
+        &connection,
+        "event_count",
+        "ALTER TABLE recordings ADD COLUMN event_count INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        &connection,
+        "dropped_event_count",
+        "ALTER TABLE recordings ADD COLUMN dropped_event_count INTEGER NOT NULL DEFAULT 0",
+    )?;
     ensure_column(
         &connection,
         "writer_error_count",
@@ -420,9 +571,11 @@ fn recording_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RecordingInfo
             .map(|value| value.max(0) as u64),
         snapshot_count: row.get::<_, i64>(6)?.max(0) as u64,
         dropped_update_count: row.get::<_, i64>(7)?.max(0) as u64,
-        writer_error_count: row.get::<_, i64>(8)?.max(0) as u64,
-        last_writer_error: row.get(9)?,
-        active: row.get(10)?,
+        event_count: row.get::<_, i64>(8)?.max(0) as u64,
+        dropped_event_count: row.get::<_, i64>(9)?.max(0) as u64,
+        writer_error_count: row.get::<_, i64>(10)?.max(0) as u64,
+        last_writer_error: row.get(11)?,
+        active: row.get(12)?,
     })
 }
 
@@ -462,6 +615,10 @@ fn now_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+fn as_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,6 +629,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let service = RecorderService::new(directory.path().join("test.sqlite3")).unwrap();
         let (_updates, receiver) = broadcast::channel(8);
+        let (events, event_receiver) = broadcast::channel(8);
         let initial = LiveSnapshotOutput {
             watch: WatchInfo {
                 watch_id: "watch-1".to_owned(),
@@ -516,12 +674,48 @@ mod tests {
                 Some("test".to_owned()),
                 initial,
                 receiver,
+                event_receiver,
             )
             .await
             .unwrap();
+        events
+            .send(RealtimeEventUpdate {
+                watch_id: "watch-1".to_owned(),
+                event: RealtimeEvent {
+                    sequence: 1,
+                    event_type: "last_trade_price".to_owned(),
+                    timestamp_ms: 3,
+                    condition_id: Some(format!("0x{}", "00".repeat(32))),
+                    token_id: Some("123".to_owned()),
+                    price: Some("0.5".to_owned()),
+                    size: Some("2".to_owned()),
+                    side: Some("BUY".to_owned()),
+                    best_bid: None,
+                    best_ask: None,
+                    old_tick_size: None,
+                    new_tick_size: None,
+                    winning_token_id: None,
+                    winning_outcome: None,
+                    question: None,
+                    slug: None,
+                },
+            })
+            .unwrap();
+        for _ in 0..100 {
+            if service
+                .recording(&recording.recording_id)
+                .unwrap()
+                .is_some_and(|recording| recording.event_count == 1)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert_eq!(service.stop_all().await.unwrap(), 1);
         let stopped = service.stop(&recording.recording_id).await.unwrap();
         assert!(!stopped.active);
         assert_eq!(stopped.snapshot_count, 1);
+        assert_eq!(stopped.event_count, 1);
 
         let listed = service.list(10).unwrap();
         assert_eq!(listed.count, 1);
@@ -530,5 +724,10 @@ mod tests {
             .unwrap();
         assert_eq!(replay.count, 1);
         assert_eq!(replay.books[0].bids[0].price, "0.4");
+        let replayed_events = service
+            .replay_events(&recording.recording_id, 0, None, None, 10)
+            .unwrap();
+        assert_eq!(replayed_events.count, 1);
+        assert_eq!(replayed_events.events[0].event_type, "last_trade_price");
     }
 }

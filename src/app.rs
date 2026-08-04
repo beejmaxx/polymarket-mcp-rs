@@ -1,5 +1,6 @@
 use std::{collections::HashMap, path::PathBuf, str::FromStr};
 
+use futures::StreamExt as _;
 use polymarket_client_sdk_v2::{
     clob::types::{Interval, TimeRange, response::OrderBookSummaryResponse},
     data::types::response::{Activity, Position, Trade},
@@ -15,16 +16,20 @@ use crate::{
     recorder::RecorderService,
     trading::{PreviewParameters, TradingService},
     types::{
-        AccountTradesOutput, BalanceAllowanceOutput, BatchPlacedOrdersOutput, CancelOrdersOutput,
-        CompareMarketsOutput, EventDetail, HolderDetail, ListMarketsInput, ListMarketsOutput,
-        ListRecordingsOutput, LiveSnapshotOutput, MarketDetail, MarketHoldersOutput, MarketSummary,
-        OpenOrder, OpenOrdersOutput, OrderApprovalStatusOutput, OrderBookDetail, OrderBookSnapshot,
-        OrderPreviewOutput, OutcomeDetail, OutcomeHolders, OutcomeQuote, PlacedOrderOutput,
-        PreviewOrderInput, PriceHistoryOutput, PriceLevel, PricePoint, RealtimeEventsOutput,
-        RealtimeStatusOutput, RecordingInfo, ReplayMarketOutput, SearchMarketsOutput, ServerStatus,
-        SimulationOutput, StopWatchOutput, TagSummary, TradingStatusOutput, WalletActivity,
-        WalletActivityOutput, WalletPosition, WalletPositionsOutput, WalletRiskOutput, WalletTrade,
-        WalletTradesOutput, WalletValueOutput, WatchInfo,
+        AccountTradesOutput, AnalyzeOrderBookInput, BalanceAllowanceOutput,
+        BatchPlacedOrdersOutput, BinaryComplementCheck, CancelOrdersOutput, CompareMarketsOutput,
+        EventDetail, HolderDetail, ListMarketsInput, ListMarketsOutput, ListRecordingsOutput,
+        LiveSnapshotOutput, MarketDetail, MarketHoldersOutput, MarketMicrostructureSummary,
+        MarketSummary, OpenOrder, OpenOrdersOutput, OrderApprovalStatusOutput,
+        OrderBookAnalysisOutput, OrderBookDetail, OrderBookSnapshot, OrderPreviewOutput,
+        OutcomeDetail, OutcomeHolders, OutcomeMicrostructureSummary, OutcomeQuote,
+        PlacedOrderOutput, PreviewOrderInput, PriceHistoryOutput, PriceLevel, PricePoint,
+        RealtimeEventsOutput, RealtimeStatusOutput, RecordingInfo, ReplayEventsOutput,
+        ReplayMarketOutput, ScanMarketMicrostructureInput, ScanMarketMicrostructureOutput,
+        SearchMarketsOutput, ServerStatus, SimulationOutput, StopWatchOutput, TagSummary,
+        TradingStatusOutput, WalletActivity, WalletActivityOutput, WalletPosition,
+        WalletPositionsOutput, WalletRiskOutput, WalletTrade, WalletTradesOutput,
+        WalletValueOutput, WatchInfo,
     },
 };
 
@@ -73,7 +78,24 @@ impl App {
             data_endpoint: DATA_ENDPOINT.to_owned(),
             websocket_endpoint: self.realtime.endpoint().to_owned(),
             database_path: self.recorder.path().display().to_string(),
+            tool_profile: "unconfigured".to_owned(),
+            tool_count: 0,
         }
+    }
+
+    pub async fn shutdown(&self) -> Result<(usize, usize), AppError> {
+        // Flush recordings while their source watches still exist, then cancel watches.
+        let recording_result = self.recorder.stop_all().await;
+        let stopped_watches = self.realtime.stop_all().await;
+        recording_result.map(|stopped_recordings| (stopped_recordings, stopped_watches))
+    }
+
+    pub async fn clob_health(&self) -> Result<String, AppError> {
+        self.client.clob_health().await
+    }
+
+    pub async fn data_health(&self) -> Result<String, AppError> {
+        self.client.data_health().await
     }
 
     pub async fn search_markets(
@@ -257,6 +279,173 @@ impl App {
         let depth = usize::from(depth.unwrap_or(20).clamp(1, 100));
         let book = self.client.order_book(token_id).await?;
         Ok(order_book_detail(book, depth))
+    }
+
+    pub async fn analyze_order_book(
+        &self,
+        input: AnalyzeOrderBookInput,
+    ) -> Result<OrderBookAnalysisOutput, AppError> {
+        let token_id = parse_u256("token_id", &input.token_id)?;
+        let depth = usize::from(input.depth.unwrap_or(50).clamp(1, 100));
+        let price_band = input
+            .price_band
+            .as_deref()
+            .map(|value| parse_decimal("price_band", value))
+            .transpose()?
+            .unwrap_or_else(|| Decimal::new(2, 2));
+        if price_band <= Decimal::ZERO || price_band > Decimal::ONE {
+            return Err(AppError::InvalidInput(
+                "price_band must be greater than 0 and no greater than 1".to_owned(),
+            ));
+        }
+        let sample_shares = input
+            .sample_shares
+            .as_deref()
+            .map(|value| parse_decimal("sample_shares", value))
+            .transpose()?
+            .unwrap_or_else(|| Decimal::from(100));
+        if sample_shares <= Decimal::ZERO {
+            return Err(AppError::InvalidInput(
+                "sample_shares must be greater than zero".to_owned(),
+            ));
+        }
+        let book = self.client.order_book(token_id).await?;
+        Ok(analyze_book(&book, depth, price_band, sample_shares))
+    }
+
+    pub async fn scan_market_microstructure(
+        &self,
+        input: ScanMarketMicrostructureInput,
+    ) -> Result<ScanMarketMicrostructureOutput, AppError> {
+        let limit = input.limit.unwrap_or(10).clamp(1, 20);
+        let depth = usize::from(input.depth.unwrap_or(20).clamp(1, 100));
+        let price_band = input
+            .price_band
+            .as_deref()
+            .map(|value| parse_decimal("price_band", value))
+            .transpose()?
+            .unwrap_or_else(|| Decimal::new(2, 2));
+        if price_band <= Decimal::ZERO || price_band > Decimal::ONE {
+            return Err(AppError::InvalidInput(
+                "price_band must be greater than 0 and no greater than 1".to_owned(),
+            ));
+        }
+        let sample_shares = input
+            .sample_shares
+            .as_deref()
+            .map(|value| parse_decimal("sample_shares", value))
+            .transpose()?
+            .unwrap_or_else(|| Decimal::from(100));
+        if sample_shares <= Decimal::ZERO {
+            return Err(AppError::InvalidInput(
+                "sample_shares must be greater than zero".to_owned(),
+            ));
+        }
+
+        let candidate_limit = u16::from(limit).saturating_mul(5).min(100);
+        let mut listed = self
+            .list_markets(ListMarketsInput {
+                limit: Some(candidate_limit),
+                offset: Some(0),
+                tag_slug: input.tag_slug,
+                featured: None,
+                min_liquidity: input.min_liquidity,
+                min_volume: None,
+                sort_by: Some("volume_24h".to_owned()),
+                ascending: Some(false),
+            })
+            .await?;
+        listed.markets.sort_by(|left, right| {
+            right
+                .volume_24h
+                .as_deref()
+                .and_then(|value| value.parse::<Decimal>().ok())
+                .cmp(
+                    &left
+                        .volume_24h
+                        .as_deref()
+                        .and_then(|value| value.parse::<Decimal>().ok()),
+                )
+        });
+        listed.markets.truncate(usize::from(limit));
+
+        let mut invalid_token_count = 0;
+        let mut tokens = HashMap::new();
+        for market in &listed.markets {
+            for outcome in &market.outcomes {
+                if let Some(token_id) = outcome.token_id.as_deref() {
+                    match parse_u256("token_id", token_id) {
+                        Ok(token) => {
+                            tokens.insert(token.to_string(), token);
+                        }
+                        Err(_) => invalid_token_count += 1,
+                    }
+                }
+            }
+        }
+
+        let client = self.client.clone();
+        let book_results = futures::stream::iter(tokens.into_iter().map(|(token_id, token)| {
+            let client = client.clone();
+            async move { (token_id, client.order_book(token).await) }
+        }))
+        .buffer_unordered(8)
+        .collect::<Vec<_>>()
+        .await;
+
+        let mut books = HashMap::new();
+        let mut book_error_count = invalid_token_count;
+        for (token_id, result) in book_results {
+            match result {
+                Ok(book) => {
+                    books.insert(token_id, book);
+                }
+                Err(_) => book_error_count += 1,
+            }
+        }
+
+        let mut outcome_book_count = 0;
+        let markets = listed
+            .markets
+            .into_iter()
+            .map(|market| {
+                let mut binary_quotes = Vec::new();
+                let outcomes = market
+                    .outcomes
+                    .iter()
+                    .filter_map(|outcome| {
+                        let token_id = outcome.token_id.as_deref()?;
+                        let book = books.get(token_id)?;
+                        outcome_book_count += 1;
+                        binary_quotes.push(best_quotes(book));
+                        let analysis = analyze_book(book, depth, price_band, sample_shares);
+                        Some(compact_microstructure(outcome.name.clone(), analysis))
+                    })
+                    .collect::<Vec<_>>();
+                let binary_complement = (market.outcomes.len() == 2 && outcomes.len() == 2)
+                    .then(|| binary_complement_check(&binary_quotes))
+                    .flatten();
+
+                MarketMicrostructureSummary {
+                    market_id: market.market_id,
+                    question: market.question,
+                    slug: market.slug,
+                    volume_24h: market.volume_24h,
+                    liquidity: market.liquidity,
+                    outcomes,
+                    binary_complement,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        Ok(ScanMarketMicrostructureOutput {
+            market_count: markets.len(),
+            outcome_book_count,
+            book_error_count,
+            markets,
+            methodology: "Scans a bounded set of active, order-accepting markets ranked by trailing 24-hour volume and fetches outcome books concurrently with at most eight requests in flight. Metrics use current public displayed L2 liquidity. Binary complement checks compare the two outcomes of one binary market only; gross edges exclude fees, latency, queue position, and the mechanics or inventory required to execute both legs. Descriptive only; not a trading recommendation."
+                .to_owned(),
+        })
     }
 
     pub async fn get_price_history(
@@ -549,8 +738,11 @@ impl App {
             .map(|value| validate_nonempty("label", value))
             .transpose()?;
         let updates = self.realtime.subscribe_updates();
+        let events = self.realtime.subscribe_events();
         let initial = self.realtime.snapshot(&watch_id, 10_000).await?;
-        self.recorder.start(watch_id, label, initial, updates).await
+        self.recorder
+            .start(watch_id, label, initial, updates, events)
+            .await
     }
 
     pub async fn stop_recording(&self, recording_id: String) -> Result<RecordingInfo, AppError> {
@@ -590,6 +782,30 @@ impl App {
         let limit = limit.unwrap_or(100).clamp(1, 5_000);
         tokio::task::spawn_blocking(move || {
             recorder.replay(&recording_id, token_id.as_deref(), start_ms, end_ms, limit)
+        })
+        .await
+        .map_err(database_task_error)?
+    }
+
+    pub async fn replay_events(
+        &self,
+        recording_id: String,
+        after_sequence: Option<u64>,
+        start_ms: Option<i64>,
+        end_ms: Option<i64>,
+        limit: Option<u32>,
+    ) -> Result<ReplayEventsOutput, AppError> {
+        let recording_id = validate_nonempty("recording_id", recording_id)?;
+        if matches!((start_ms, end_ms), (Some(start), Some(end)) if start > end) {
+            return Err(AppError::InvalidInput(
+                "start_ms must not be later than end_ms".to_owned(),
+            ));
+        }
+        let recorder = self.recorder.clone();
+        let after_sequence = after_sequence.unwrap_or(0);
+        let limit = limit.unwrap_or(100).clamp(1, 5_000);
+        tokio::task::spawn_blocking(move || {
+            recorder.replay_events(&recording_id, after_sequence, start_ms, end_ms, limit)
         })
         .await
         .map_err(database_task_error)?
@@ -968,7 +1184,7 @@ fn order_book_snapshot(book: OrderBookSummaryResponse) -> OrderBookSnapshot {
         bid_levels: book.bids.len(),
         ask_levels: book.asks.len(),
         min_order_size: book.min_order_size.to_string(),
-        tick_size: book.tick_size.to_string(),
+        tick_size: book.tick_size.as_decimal().to_string(),
         last_trade_price: book.last_trade_price.map(|value| value.to_string()),
     }
 }
@@ -1056,6 +1272,178 @@ fn wallet_activity(activity: Activity) -> WalletActivity {
     }
 }
 
+fn analyze_book(
+    book: &OrderBookSummaryResponse,
+    depth: usize,
+    price_band: Decimal,
+    sample_shares: Decimal,
+) -> OrderBookAnalysisOutput {
+    let mut bids = book
+        .bids
+        .iter()
+        .map(|level| (level.price, level.size))
+        .collect::<Vec<_>>();
+    bids.sort_by(|left, right| right.0.cmp(&left.0));
+    bids.truncate(depth);
+    let mut asks = book
+        .asks
+        .iter()
+        .map(|level| (level.price, level.size))
+        .collect::<Vec<_>>();
+    asks.sort_by_key(|(price, _)| *price);
+    asks.truncate(depth);
+
+    let best_bid = bids.first().copied();
+    let best_ask = asks.first().copied();
+    let spread = best_bid.zip(best_ask).map(|((bid, _), (ask, _))| ask - bid);
+    let midpoint = best_bid
+        .zip(best_ask)
+        .map(|((bid, _), (ask, _))| (bid + ask) / Decimal::TWO);
+    let microprice =
+        best_bid
+            .zip(best_ask)
+            .and_then(|((bid_price, bid_size), (ask_price, ask_size))| {
+                let top_size = bid_size + ask_size;
+                (top_size > Decimal::ZERO)
+                    .then(|| (ask_price * bid_size + bid_price * ask_size) / top_size)
+            });
+    let top_level_imbalance = best_bid
+        .zip(best_ask)
+        .and_then(|((_, bid_size), (_, ask_size))| imbalance_percent(bid_size, ask_size));
+
+    let (bid_depth_shares, bid_depth_notional) = level_totals(&bids);
+    let (ask_depth_shares, ask_depth_notional) = level_totals(&asks);
+    let depth_imbalance = imbalance_percent(bid_depth_shares, ask_depth_shares);
+
+    let near_bids = best_bid.map_or_else(Vec::new, |(price, _)| {
+        let minimum = price - price_band;
+        bids.iter()
+            .copied()
+            .filter(|(level_price, _)| *level_price >= minimum)
+            .collect::<Vec<_>>()
+    });
+    let near_asks = best_ask.map_or_else(Vec::new, |(price, _)| {
+        let maximum = price + price_band;
+        asks.iter()
+            .copied()
+            .filter(|(level_price, _)| *level_price <= maximum)
+            .collect::<Vec<_>>()
+    });
+    let (near_touch_bid_shares, near_touch_bid_notional) = level_totals(&near_bids);
+    let (near_touch_ask_shares, near_touch_ask_notional) = level_totals(&near_asks);
+
+    OrderBookAnalysisOutput {
+        token_id: book.asset_id.to_string(),
+        condition_id: book.market.to_string(),
+        book_timestamp: book.timestamp.to_rfc3339(),
+        book_hash: book.hash.clone(),
+        tick_size: book.tick_size.as_decimal().to_string(),
+        min_order_size: book.min_order_size.to_string(),
+        last_trade_price: book.last_trade_price.map(|value| value.to_string()),
+        best_bid: best_bid.map(|(price, _)| price.to_string()),
+        best_ask: best_ask.map(|(price, _)| price.to_string()),
+        spread: spread.map(|value| value.to_string()),
+        midpoint: midpoint.map(|value| value.to_string()),
+        microprice: microprice.map(|value| value.to_string()),
+        top_bid_size: best_bid.map(|(_, size)| size.to_string()),
+        top_ask_size: best_ask.map(|(_, size)| size.to_string()),
+        top_level_imbalance_percent: top_level_imbalance.map(|value| value.to_string()),
+        depth_limit: depth,
+        bid_levels_considered: bids.len(),
+        ask_levels_considered: asks.len(),
+        bid_depth_shares: bid_depth_shares.to_string(),
+        ask_depth_shares: ask_depth_shares.to_string(),
+        bid_depth_notional: bid_depth_notional.to_string(),
+        ask_depth_notional: ask_depth_notional.to_string(),
+        depth_imbalance_percent: depth_imbalance.map(|value| value.to_string()),
+        near_touch_price_band: price_band.to_string(),
+        near_touch_bid_shares: near_touch_bid_shares.to_string(),
+        near_touch_ask_shares: near_touch_ask_shares.to_string(),
+        near_touch_bid_notional: near_touch_bid_notional.to_string(),
+        near_touch_ask_notional: near_touch_ask_notional.to_string(),
+        sample_shares: sample_shares.to_string(),
+        sample_buy: simulate_book(book, "buy", sample_shares),
+        sample_sell: simulate_book(book, "sell", sample_shares),
+        methodology: "Uses the current public L2 book. Microprice weights the best prices by opposite-side displayed size; imbalance is (bid size - ask size) / total size. Depth and near-touch totals use at most depth_limit levels per side. Sample executions walk the full displayed book and exclude fees, latency, queue position, and subsequent price changes. Descriptive only; not a prediction or trading recommendation.".to_owned(),
+    }
+}
+
+fn level_totals(levels: &[(Decimal, Decimal)]) -> (Decimal, Decimal) {
+    levels.iter().fold(
+        (Decimal::ZERO, Decimal::ZERO),
+        |(shares, notional), (price, size)| (shares + *size, notional + *price * *size),
+    )
+}
+
+fn imbalance_percent(bid_size: Decimal, ask_size: Decimal) -> Option<Decimal> {
+    let total = bid_size + ask_size;
+    (total > Decimal::ZERO).then(|| (bid_size - ask_size) / total * Decimal::from(100))
+}
+
+type BestQuote = (Option<(Decimal, Decimal)>, Option<(Decimal, Decimal)>);
+
+fn best_quotes(book: &OrderBookSummaryResponse) -> BestQuote {
+    let best_bid = book
+        .bids
+        .iter()
+        .map(|level| (level.price, level.size))
+        .max_by_key(|(price, _)| *price);
+    let best_ask = book
+        .asks
+        .iter()
+        .map(|level| (level.price, level.size))
+        .min_by_key(|(price, _)| *price);
+    (best_bid, best_ask)
+}
+
+fn compact_microstructure(
+    outcome: String,
+    analysis: OrderBookAnalysisOutput,
+) -> OutcomeMicrostructureSummary {
+    OutcomeMicrostructureSummary {
+        outcome,
+        token_id: analysis.token_id,
+        best_bid: analysis.best_bid,
+        best_ask: analysis.best_ask,
+        spread: analysis.spread,
+        midpoint: analysis.midpoint,
+        microprice: analysis.microprice,
+        top_level_imbalance_percent: analysis.top_level_imbalance_percent,
+        bid_depth_shares: analysis.bid_depth_shares,
+        ask_depth_shares: analysis.ask_depth_shares,
+        depth_imbalance_percent: analysis.depth_imbalance_percent,
+        near_touch_bid_shares: analysis.near_touch_bid_shares,
+        near_touch_ask_shares: analysis.near_touch_ask_shares,
+        sample_buy_average_price: analysis.sample_buy.average_price,
+        sample_buy_slippage_bps: analysis.sample_buy.slippage_bps,
+        sample_buy_complete: analysis.sample_buy.complete_fill,
+        sample_sell_average_price: analysis.sample_sell.average_price,
+        sample_sell_slippage_bps: analysis.sample_sell.slippage_bps,
+        sample_sell_complete: analysis.sample_sell.complete_fill,
+    }
+}
+
+fn binary_complement_check(quotes: &[BestQuote]) -> Option<BinaryComplementCheck> {
+    if quotes.len() != 2 {
+        return None;
+    }
+    let asks = quotes[0].1.zip(quotes[1].1);
+    let bids = quotes[0].0.zip(quotes[1].0);
+
+    Some(BinaryComplementCheck {
+        best_ask_sum: asks.map(|((left, _), (right, _))| (left + right).to_string()),
+        buy_both_gross_edge_per_share: asks
+            .map(|((left, _), (right, _))| (Decimal::ONE - left - right).to_string()),
+        buy_both_top_level_capacity_shares: asks
+            .map(|((_, left), (_, right))| left.min(right).to_string()),
+        best_bid_sum: bids.map(|((left, _), (right, _))| (left + right).to_string()),
+        sell_both_gross_edge_per_share: bids
+            .map(|((left, _), (right, _))| (left + right - Decimal::ONE).to_string()),
+        sell_both_top_level_capacity_shares: bids
+            .map(|((_, left), (_, right))| left.min(right).to_string()),
+    })
+}
+
 fn simulate_book(
     book: &OrderBookSummaryResponse,
     side: &str,
@@ -1127,7 +1515,17 @@ fn simulate_book(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use polymarket_client_sdk_v2::types::U256;
+    use polymarket_client_sdk_v2::{
+        clob::types::{TickSize, response::OrderSummary},
+        types::{B256, DateTime, U256},
+    };
+
+    fn order(price: &str, size: &str) -> OrderSummary {
+        OrderSummary::builder()
+            .price(price.parse::<Decimal>().unwrap())
+            .size(size.parse::<Decimal>().unwrap())
+            .build()
+    }
 
     #[test]
     fn rejects_blank_values() {
@@ -1164,6 +1562,96 @@ mod tests {
         assert_eq!(parse_interval("1d").unwrap(), Interval::OneDay);
         let error = parse_interval("daily").unwrap_err();
         assert_eq!(error.code(), "invalid_input");
+    }
+
+    #[test]
+    fn order_book_analysis_calculates_microstructure_and_impact() {
+        let book = OrderBookSummaryResponse::builder()
+            .market(B256::ZERO)
+            .asset_id(U256::from(123_u64))
+            .timestamp(DateTime::from_timestamp_millis(1_700_000_000_000).unwrap())
+            .bids(vec![order("0.48", "70"), order("0.49", "30")])
+            .asks(vec![order("0.52", "40"), order("0.51", "10")])
+            .min_order_size("5".parse::<Decimal>().unwrap())
+            .neg_risk(false)
+            .tick_size(TickSize::Hundredth)
+            .build();
+
+        let analysis = analyze_book(
+            &book,
+            2,
+            "0.01".parse::<Decimal>().unwrap(),
+            Decimal::from(20),
+        );
+
+        assert_eq!(
+            analysis
+                .microprice
+                .as_deref()
+                .unwrap()
+                .parse::<Decimal>()
+                .unwrap(),
+            "0.505".parse::<Decimal>().unwrap()
+        );
+        assert_eq!(
+            analysis
+                .top_level_imbalance_percent
+                .as_deref()
+                .unwrap()
+                .parse::<Decimal>()
+                .unwrap(),
+            Decimal::from(50)
+        );
+        assert_eq!(analysis.bid_depth_shares, "100");
+        assert_eq!(analysis.ask_depth_shares, "50");
+        assert_eq!(analysis.near_touch_bid_shares, "100");
+        assert_eq!(analysis.near_touch_ask_shares, "50");
+        assert_eq!(analysis.sample_buy.filled_shares, "20");
+        assert_eq!(
+            analysis
+                .sample_buy
+                .average_price
+                .as_deref()
+                .unwrap()
+                .parse::<Decimal>()
+                .unwrap(),
+            "0.515".parse::<Decimal>().unwrap()
+        );
+        assert_eq!(analysis.sample_sell.worst_price.as_deref(), Some("0.49"));
+    }
+
+    #[test]
+    fn binary_complement_check_reports_gross_edges_and_capacity() {
+        let quotes = [
+            (
+                Some(("0.48".parse().unwrap(), "70".parse().unwrap())),
+                Some(("0.51".parse().unwrap(), "10".parse().unwrap())),
+            ),
+            (
+                Some(("0.47".parse().unwrap(), "25".parse().unwrap())),
+                Some(("0.50".parse().unwrap(), "40".parse().unwrap())),
+            ),
+        ];
+        let check = binary_complement_check(&quotes).unwrap();
+
+        assert_eq!(check.best_ask_sum.as_deref(), Some("1.01"));
+        assert_eq!(
+            check.buy_both_gross_edge_per_share.as_deref(),
+            Some("-0.01")
+        );
+        assert_eq!(
+            check.buy_both_top_level_capacity_shares.as_deref(),
+            Some("10")
+        );
+        assert_eq!(check.best_bid_sum.as_deref(), Some("0.95"));
+        assert_eq!(
+            check.sell_both_gross_edge_per_share.as_deref(),
+            Some("-0.05")
+        );
+        assert_eq!(
+            check.sell_both_top_level_capacity_shares.as_deref(),
+            Some("25")
+        );
     }
 
     #[test]

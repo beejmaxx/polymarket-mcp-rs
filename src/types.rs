@@ -61,6 +61,44 @@ pub struct GetOrderBookInput {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct AnalyzeOrderBookInput {
+    #[schemars(description = "Decimal CLOB outcome token ID")]
+    pub token_id: String,
+    #[schemars(
+        description = "Maximum price levels per side used for aggregate depth metrics; defaults to 50 and is capped at 100"
+    )]
+    pub depth: Option<u16>,
+    #[schemars(
+        description = "Absolute price distance from each best price used for near-touch liquidity; defaults to 0.02"
+    )]
+    pub price_band: Option<String>,
+    #[schemars(
+        description = "Outcome shares used for two-sided execution-impact estimates; defaults to 100"
+    )]
+    pub sample_shares: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ScanMarketMicrostructureInput {
+    #[schemars(
+        description = "Maximum active markets to inspect; defaults to 10 and is capped at 20"
+    )]
+    pub limit: Option<u8>,
+    #[schemars(description = "Optional Gamma topic tag slug, such as politics or crypto")]
+    pub tag_slug: Option<String>,
+    #[schemars(description = "Optional minimum market liquidity as an exact decimal string")]
+    pub min_liquidity: Option<String>,
+    #[schemars(
+        description = "Maximum levels per outcome side used for depth metrics; defaults to 20 and is capped at 100"
+    )]
+    pub depth: Option<u16>,
+    #[schemars(description = "Absolute near-touch price distance; defaults to 0.02")]
+    pub price_band: Option<String>,
+    #[schemars(description = "Shares used for sample buy and sell impact; defaults to 100")]
+    pub sample_shares: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetPriceHistoryInput {
     #[schemars(description = "Decimal CLOB outcome token ID")]
     pub token_id: String,
@@ -190,6 +228,20 @@ pub struct ReplayMarketInput {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct ReplayEventsInput {
+    #[schemars(description = "Recording ID returned by start_recording")]
+    pub recording_id: String,
+    #[schemars(description = "Return events after this watch-local sequence number")]
+    pub after_sequence: Option<u64>,
+    #[schemars(description = "Optional inclusive upstream timestamp in milliseconds")]
+    pub start_ms: Option<i64>,
+    #[schemars(description = "Optional inclusive upstream timestamp in milliseconds")]
+    pub end_ms: Option<i64>,
+    #[schemars(description = "Maximum events; defaults to 100 and is capped at 5000")]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct SimulateOrderInput {
     #[schemars(description = "Decimal CLOB outcome token ID")]
     pub token_id: String,
@@ -301,6 +353,8 @@ pub struct ServerStatus {
     pub data_endpoint: String,
     pub websocket_endpoint: String,
     pub database_path: String,
+    pub tool_profile: String,
+    pub tool_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
@@ -420,6 +474,95 @@ pub struct OrderBookDetail {
     pub summary: OrderBookSnapshot,
     pub bids: Vec<PriceLevel>,
     pub asks: Vec<PriceLevel>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct OrderBookAnalysisOutput {
+    pub token_id: String,
+    pub condition_id: String,
+    pub book_timestamp: String,
+    pub book_hash: Option<String>,
+    pub tick_size: String,
+    pub min_order_size: String,
+    pub last_trade_price: Option<String>,
+    pub best_bid: Option<String>,
+    pub best_ask: Option<String>,
+    pub spread: Option<String>,
+    pub midpoint: Option<String>,
+    pub microprice: Option<String>,
+    pub top_bid_size: Option<String>,
+    pub top_ask_size: Option<String>,
+    pub top_level_imbalance_percent: Option<String>,
+    pub depth_limit: usize,
+    pub bid_levels_considered: usize,
+    pub ask_levels_considered: usize,
+    pub bid_depth_shares: String,
+    pub ask_depth_shares: String,
+    pub bid_depth_notional: String,
+    pub ask_depth_notional: String,
+    pub depth_imbalance_percent: Option<String>,
+    pub near_touch_price_band: String,
+    pub near_touch_bid_shares: String,
+    pub near_touch_ask_shares: String,
+    pub near_touch_bid_notional: String,
+    pub near_touch_ask_notional: String,
+    pub sample_shares: String,
+    pub sample_buy: SimulationOutput,
+    pub sample_sell: SimulationOutput,
+    pub methodology: String,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct ScanMarketMicrostructureOutput {
+    pub market_count: usize,
+    pub outcome_book_count: usize,
+    pub book_error_count: usize,
+    pub markets: Vec<MarketMicrostructureSummary>,
+    pub methodology: String,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct MarketMicrostructureSummary {
+    pub market_id: String,
+    pub question: Option<String>,
+    pub slug: Option<String>,
+    pub volume_24h: Option<String>,
+    pub liquidity: Option<String>,
+    pub outcomes: Vec<OutcomeMicrostructureSummary>,
+    pub binary_complement: Option<BinaryComplementCheck>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct OutcomeMicrostructureSummary {
+    pub outcome: String,
+    pub token_id: String,
+    pub best_bid: Option<String>,
+    pub best_ask: Option<String>,
+    pub spread: Option<String>,
+    pub midpoint: Option<String>,
+    pub microprice: Option<String>,
+    pub top_level_imbalance_percent: Option<String>,
+    pub bid_depth_shares: String,
+    pub ask_depth_shares: String,
+    pub depth_imbalance_percent: Option<String>,
+    pub near_touch_bid_shares: String,
+    pub near_touch_ask_shares: String,
+    pub sample_buy_average_price: Option<String>,
+    pub sample_buy_slippage_bps: Option<String>,
+    pub sample_buy_complete: bool,
+    pub sample_sell_average_price: Option<String>,
+    pub sample_sell_slippage_bps: Option<String>,
+    pub sample_sell_complete: bool,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct BinaryComplementCheck {
+    pub best_ask_sum: Option<String>,
+    pub buy_both_gross_edge_per_share: Option<String>,
+    pub buy_both_top_level_capacity_shares: Option<String>,
+    pub best_bid_sum: Option<String>,
+    pub sell_both_gross_edge_per_share: Option<String>,
+    pub sell_both_top_level_capacity_shares: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
@@ -591,7 +734,7 @@ pub struct RealtimeEventsOutput {
     pub events: Vec<RealtimeEvent>,
 }
 
-#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct RealtimeEvent {
     pub sequence: u64,
     pub event_type: String,
@@ -650,6 +793,8 @@ pub struct RecordingInfo {
     pub stopped_at_ms: Option<u64>,
     pub snapshot_count: u64,
     pub dropped_update_count: u64,
+    pub event_count: u64,
+    pub dropped_event_count: u64,
     pub writer_error_count: u64,
     pub last_writer_error: Option<String>,
     pub active: bool,
@@ -666,6 +811,13 @@ pub struct ReplayMarketOutput {
     pub recording_id: String,
     pub count: usize,
     pub books: Vec<LiveOrderBook>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct ReplayEventsOutput {
+    pub recording_id: String,
+    pub count: usize,
+    pub events: Vec<RealtimeEvent>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]

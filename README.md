@@ -1,21 +1,66 @@
-# polymarket-mcp-rs
+# Polymarket MCP
 
-An early-release Polymarket MCP server in Rust, built for accurate public market intelligence and carefully gated optional trading. It covers discovery, current and historical market data, public wallet analytics, reconstructed CLOB books, SQLite recording/replay, fill simulation, and authenticated account operations.
+[![CI](https://github.com/beejmaxx/polymarket-mcp-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/beejmaxx/polymarket-mcp-rs/actions/workflows/ci.yml)
+[![Production API canary](https://github.com/beejmaxx/polymarket-mcp-rs/actions/workflows/live-canary.yml/badge.svg)](https://github.com/beejmaxx/polymarket-mcp-rs/actions/workflows/live-canary.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-The server uses Polymarket's official Rust V2 SDK and explicitly targets the current production endpoints rather than the SDK's legacy default hostname.
+A self-contained Rust MCP server for Polymarket: public discovery, exact CLOB V2 books, wallet analytics, realtime market state, SQLite recording/replay, fill simulation, and safely gated optional trading.
 
-## What it exposes
+The default `research` profile needs no API key or wallet. It exposes 27 public/realtime tools and does not advertise or accept calls to authenticated trading tools.
 
-- Discovery: `search_markets`, `list_markets`, `get_event`, `get_market`, `compare_markets`
-- Market data: `get_order_book`, `get_price_history`, `get_market_holders`
-- Public wallets: `get_wallet_positions`, `get_wallet_value`, `get_wallet_trades`, `get_wallet_activity`, `analyze_wallet_risk`
-- Realtime: `watch_markets`, `get_live_snapshot`, `get_realtime_events`, `get_realtime_status`, `stop_watching`
-- Market lab: `simulate_order`, `start_recording`, `stop_recording`, `list_recordings`, `replay_market`
-- Trading: `trading_status`, `preview_order`, `get_order_approval`, `place_order`, `place_batch_orders`, `get_order`, `list_open_orders`, `list_account_trades`, `get_balance_allowance`, `cancel_order`, `cancel_market_orders`, `cancel_all_orders`
+## Install in a minute
 
-All successful results are typed structured JSON. Errors include a stable code, readable message, and retryability flag. Exact financial values and 256-bit identifiers cross the MCP boundary as strings, avoiding JSON floating-point loss.
+macOS or Linux:
 
-See [docs/PARITY.md](docs/PARITY.md) for the Python-server capability mapping.
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/beejmaxx/polymarket-mcp-rs/main/scripts/install.sh | sh
+polymarket-mcp-rs doctor
+```
+
+Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/beejmaxx/polymarket-mcp-rs/main/scripts/install.ps1 | iex
+polymarket-mcp-rs doctor
+```
+
+Then add it to a client:
+
+```bash
+codex mcp add polymarket -- polymarket-mcp-rs
+# or
+claude mcp add polymarket -- polymarket-mcp-rs
+```
+
+Prebuilt binaries and a one-click `polymarket-mcp.mcpb` bundle are attached to every [GitHub release](https://github.com/beejmaxx/polymarket-mcp-rs/releases). See [the install guide](docs/INSTALL.md) for Claude Desktop, VS Code, source builds, custom database paths, and Windows details.
+
+## Why this server
+
+- Broad replacement surface: 39 tools across public data, live books, research workflows, and opt-in account operations.
+- Correct numeric boundaries: decimal financial values and 256-bit IDs stay strings across JSON, preventing floating-point and integer loss.
+- Stateful market research: Rust maintains reconstructed books and feed health internally instead of sending every tick to the model.
+- Honest replay: SQLite stores observations captured by this process, tracks dropped updates, and never presents them as complete exchange history.
+- Safe defaults: trading tools are absent by default; exposing them and enabling mutation are separate decisions.
+- Operationally simple: one binary, stdio transport, structured errors, an offline/online doctor, graceful shutdown, daily production canaries, checksums, SBOMs, and release provenance.
+
+## A useful first prompt
+
+> Find the five highest-volume active Polymarket markets. For each, show the current outcome prices, liquidity, spread, order-book imbalance, and estimated slippage for 100 shares. Explain data limitations and do not recommend a trade.
+
+Other demo prompts are in [docs/DEMO.md](docs/DEMO.md).
+
+## Tool profiles
+
+| Profile | Tools | Intended use |
+|---|---:|---|
+| `core` | 17 | Public REST discovery, books, wallets, analysis, and simulation |
+| `research` (default) | 27 | Core plus realtime watching and local recording/replay |
+| `trading` | 29 | Core plus authenticated account and trading operations |
+| `all` | 39 | Research and trading together |
+
+Select a profile with `--tool-profile research` or `POLYMARKET_TOOL_PROFILE=research`. Hidden tools are removed from both `tools/list` and dispatch. Choosing `trading` or `all` only exposes the tool definitions; order mutation still requires `POLYMARKET_ENABLE_TRADING=true`, a signer, local caps, and per-operation confirmation.
+
+Run `polymarket-mcp-rs tools` to inspect the default catalog or `polymarket-mcp-rs --tool-profile all tools --json` for complete schemas. See [docs/TOOLS.md](docs/TOOLS.md) for the grouped reference.
 
 ## Architecture
 
@@ -23,98 +68,62 @@ See [docs/PARITY.md](docs/PARITY.md) for the Python-server capability mapping.
 MCP client (stdio)
         |
         v
-server.rs          schemas + thin handlers
+tool profile + typed MCP schemas
         |
         v
-app.rs             validation + use cases + stable output mapping
-   |          |             |                 |
-   v          v             v                 v
-API clients  realtime.rs  recorder.rs       trading.rs
-Gamma/Data/  WS books     SQLite writer     opt-in signer,
-CLOB REST    + health     + replay          approvals + caps
+validation and stable output mapping
+   |              |                |                 |
+Gamma/Data/    CLOB REST      realtime books      SQLite + trading
+public APIs    exact books    WebSocket health    replay / audit
 ```
 
-The websocket service keeps full books inside the process; MCP receives compact snapshots rather than raw tick streams. A watch is immediately seeded from CLOB REST as `rest_seed`. Full websocket snapshots and `price_change` placement/cancellation deltas then maintain the book as `websocket_snapshot` or `websocket_delta`. Connection state, reconnects, source-specific counters, local receipt time, feed age, errors, and dropped recording updates remain explicit.
-
-SQLite writes run through a bounded channel on a dedicated writer thread. Replay is ordered by upstream timestamp and insertion ID, and only claims to replay observations captured by this server.
-
-## Build and verify
-
-Rust 1.88 or newer is required.
-
-```bash
-cargo build --release
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features
-cargo test --test live_api -- --ignored --nocapture
-```
-
-Normal tests are offline. The ignored suite exercises current production Gamma, Data, CLOB REST, wallet, simulation, genuine websocket delivery, watch lifecycle, SQLite recording, and replay paths. It never places an order.
-
-## Install
-
-Until the first crates.io release, build from source:
-
-```bash
-git clone https://github.com/beejmaxx/polymarket-mcp-rs.git
-cd polymarket-mcp-rs
-cargo install --path . --locked
-```
-
-## Run over stdio
-
-```json
-{
-  "mcpServers": {
-    "polymarket": {
-      "command": "/absolute/path/to/polymarket-mcp-rs/target/release/polymarket-mcp-rs",
-      "env": {
-        "RUST_LOG": "info",
-        "POLYMARKET_MCP_DB": "/absolute/path/to/polymarket-mcp.sqlite3"
-      }
-    }
-  }
-}
-```
-
-Logs go only to stderr; stdout is reserved for MCP. `POLYMARKET_MCP_DB` defaults to `polymarket-mcp.sqlite3` in the process working directory.
+The WebSocket engine seeds each watched token from CLOB REST, then applies full snapshots and incremental price changes. Connection state, reconnects, source-specific counters, local receipt time, feed age, errors, and recording gaps remain explicit. SQLite writes use a bounded channel and dedicated writer thread; active recordings flush before watches stop on MCP EOF, SIGINT, or SIGTERM.
 
 ## Configuration
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `POLYMARKET_MCP_DB` | `polymarket-mcp.sqlite3` | SQLite recording database |
-| `POLYMARKET_WS_URL` | Official production market websocket | Override the full market websocket URL |
-| `POLYMARKET_WS_PROXY` | unset | Unauthenticated `socks5://host:port` websocket proxy |
+| `POLYMARKET_TOOL_PROFILE` | `research` | `core`, `research`, `trading`, or `all` |
+| `POLYMARKET_MCP_DB` | `polymarket-mcp.sqlite3` | SQLite recording and approval-audit database |
+| `POLYMARKET_WS_URL` | Production market WebSocket | Override the full WebSocket URL |
+| `POLYMARKET_WS_PROXY` | unset | Unauthenticated `socks5://host:port` WebSocket proxy |
 | `HTTPS_PROXY` / `HTTP_PROXY` | environment dependent | Proxy used by HTTP API clients |
 | `RUST_LOG` | `info` | stderr log filtering |
 
-`ALL_PROXY=socks5://...` is also honored for websocket connections when `POLYMARKET_WS_PROXY` is unset.
+`ALL_PROXY=socks5://...` is also honored for WebSocket connections when `POLYMARKET_WS_PROXY` is unset. The server has no telemetry. It connects only to configured Polymarket endpoints and writes only to its configured SQLite path.
 
-## Trading safety
+## Trading is a separate opt-in
 
-Trading is disabled by default. Merely providing a private key does not enable it. To opt in:
+Read [SECURITY.md](SECURITY.md) and [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) first. At minimum:
 
 ```bash
+export POLYMARKET_TOOL_PROFILE=all
 export POLYMARKET_ENABLE_TRADING=true
 export POLYMARKET_PRIVATE_KEY=0x...
 export POLYMARKET_MAX_ORDER_USDC=100
-# eoa, proxy, gnosis_safe, or poly1271
 export POLYMARKET_SIGNATURE_TYPE=eoa
-# Required for poly1271; optional for proxy/safe when automatic derivation is correct
-export POLYMARKET_FUNDER_ADDRESS=0x...
 ```
 
-The private key is parsed into a signer and never returned by a tool or logged. Authentication is lazy. EOA, legacy Proxy, Gnosis Safe, and deposit-wallet POLY_1271 configurations are supported. Authenticated clients send automatic heartbeats, and placement checks Polymarket's geographic eligibility response first. Order placement uses a two-step flow:
+EOA, legacy Proxy, Gnosis Safe, and POLY_1271 configurations are supported. `preview_order` performs policy and current-market-rule checks and creates a single-use five-minute approval. `place_order` consumes that approval and requires `confirm=true`; batch placement requires `PLACE_BATCH`. Cancellations have their own confirmations. Approval transitions are persisted before submission, and ambiguous network outcomes are never reported as safe retries.
 
-1. `preview_order` applies local type, side, unit, decimal, and notional policy checks and, by default, fetches the current tick size and minimum order size before returning a single-use approval that expires after five minutes. It does not guarantee exchange acceptance or execution.
-2. `place_order` consumes that approval and also requires `confirm=true`. Batch placement requires `PLACE_BATCH` and applies the cap to the entire batch.
+## Development and evidence
 
-Approval transitions are written to SQLite before submission. `get_order_approval` distinguishes approved, validating, submitting, submitted, expired, and ambiguous `unknown` outcomes so a lost network response is not silently treated as a safe retry.
+Rust 1.88 or newer is required:
 
-`cancel_order` requires `confirm=true`; cancel-by-market and cancel-all require `CANCEL_MARKET` and `CANCEL_ALL`. Preview, public tools, and authenticated account reads work while order mutation remains disabled.
+```bash
+cargo fmt --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-features
+cargo test --locked --test live_api -- --ignored --nocapture
+```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for development expectations and [SECURITY.md](SECURITY.md) before configuring a signer.
+Normal tests are offline and launch the compiled executable as a real stdio MCP subprocess. The ignored suite exercises current production Gamma, Data, CLOB REST, wallet, scanning, WebSocket, recording, replay, and simulation paths; it never places an order. Tool catalogs have committed golden contracts, and release tags rebuild on five OS/architecture targets.
+
+- [Python replacement matrix](docs/PARITY.md)
+- [Same-token Python comparison](docs/PYTHON_COMPARISON.md)
+- [Compatibility](docs/COMPATIBILITY.md)
+- [Contract stability](docs/STABILITY.md)
+- [Roadmap](docs/ROADMAP.md)
+- [Contributing](CONTRIBUTING.md)
 
 This software provides market infrastructure, not trading recommendations or financial advice.

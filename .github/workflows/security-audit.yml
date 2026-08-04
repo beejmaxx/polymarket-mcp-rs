@@ -1,0 +1,25 @@
+name: Dependency security audit
+
+on:
+  push:
+    branches: [main]
+    paths: ["Cargo.toml", "Cargo.lock"]
+  pull_request:
+    paths: ["Cargo.toml", "Cargo.lock"]
+  schedule:
+    - cron: "43 8 * * 2"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  checks: write
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

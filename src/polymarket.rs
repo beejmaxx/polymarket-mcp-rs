@@ -65,6 +65,18 @@ impl PolymarketClient {
         Ok(Self { gamma, clob, data })
     }
 
+    pub async fn clob_health(&self) -> Result<String, AppError> {
+        self.clob.ok().await.map_err(clob_error)
+    }
+
+    pub async fn data_health(&self) -> Result<String, AppError> {
+        self.data
+            .health()
+            .await
+            .map(|health| health.data)
+            .map_err(data_error)
+    }
+
     pub async fn search(&self, query: &str, limit: i32) -> Result<SearchResults, AppError> {
         let request = SearchRequest::builder()
             .q(query)

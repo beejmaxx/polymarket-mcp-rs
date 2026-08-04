@@ -1,4 +1,13 @@
-use polymarket_mcp_rs::{App, types::ListMarketsInput};
+use polymarket_mcp_rs::{
+    App,
+    types::{AnalyzeOrderBookInput, ListMarketsInput, ScanMarketMicrostructureInput},
+};
+use rmcp::{
+    ServiceExt,
+    model::CallToolRequestParams,
+    transport::{ConfigureCommandExt, TokioChildProcess},
+};
+use serde_json::json;
 use std::time::Duration;
 
 #[tokio::test]
@@ -17,6 +26,50 @@ async fn search_then_fetch_market_from_production() {
     let market = app.get_market(first.market_id.clone()).await.unwrap();
     assert_eq!(market.market_id, first.market_id);
     assert!(!market.outcomes.is_empty());
+}
+
+#[tokio::test]
+#[ignore = "requires live Polymarket APIs"]
+async fn compiled_stdio_binary_serves_live_structured_tools() {
+    let directory = tempfile::tempdir().unwrap();
+    let transport = TokioChildProcess::new(
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_polymarket-mcp-rs")).configure(
+            |command| {
+                command.current_dir(directory.path()).env(
+                    "POLYMARKET_MCP_DB",
+                    directory.path().join("stdio-live.sqlite3"),
+                );
+            },
+        ),
+    )
+    .unwrap();
+    let client = ().serve(transport).await.unwrap();
+
+    let search = client
+        .peer()
+        .call_tool(CallToolRequestParams::new("search_markets").with_arguments(
+            serde_json::from_value(json!({"query": "bitcoin", "limit": 3})).unwrap(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(search.is_error, Some(false));
+    let search = search.structured_content.expect("typed search response");
+    assert!(search["count"].as_u64().unwrap_or_default() > 0);
+
+    let scan = client
+        .peer()
+        .call_tool(
+            CallToolRequestParams::new("scan_market_microstructure")
+                .with_arguments(serde_json::from_value(json!({"limit": 2, "depth": 5})).unwrap()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(scan.is_error, Some(false));
+    let scan = scan.structured_content.expect("typed scanner response");
+    assert!(scan["market_count"].as_u64().unwrap_or_default() > 0);
+    assert!(scan["outcome_book_count"].as_u64().unwrap_or_default() > 0);
+
+    client.cancel().await.unwrap();
 }
 
 #[tokio::test]
@@ -72,6 +125,32 @@ async fn discovery_books_history_and_holders_work_in_production() {
     assert_eq!(book.summary.token_id, token_id);
     assert!(book.bids.len() <= 5);
     assert!(book.asks.len() <= 5);
+    let analysis = app
+        .analyze_order_book(AnalyzeOrderBookInput {
+            token_id: token_id.clone(),
+            depth: Some(10),
+            price_band: Some("0.02".to_owned()),
+            sample_shares: Some("10".to_owned()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(analysis.token_id, token_id);
+    assert_eq!(analysis.sample_buy.requested_shares, "10");
+    assert_eq!(analysis.sample_sell.requested_shares, "10");
+
+    let scan = app
+        .scan_market_microstructure(ScanMarketMicrostructureInput {
+            limit: Some(3),
+            tag_slug: None,
+            min_liquidity: None,
+            depth: Some(10),
+            price_band: Some("0.02".to_owned()),
+            sample_shares: Some("25".to_owned()),
+        })
+        .await
+        .unwrap();
+    assert!(scan.market_count <= 3);
+    assert!(scan.outcome_book_count > 0);
 
     let history = app
         .get_price_history(token_id.clone(), Some("1d".to_owned()), None, None, Some(5))

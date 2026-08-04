@@ -1,0 +1,180 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --all-features
+      - run: cargo package --locked
+
+  build:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            asset: polymarket-mcp-rs-linux-x86_64
+            binary: polymarket-mcp-rs
+            archive: tar
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            asset: polymarket-mcp-rs-linux-aarch64
+            binary: polymarket-mcp-rs
+            archive: tar
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            asset: polymarket-mcp-rs-macos-x86_64
+            binary: polymarket-mcp-rs
+            archive: tar
+          - os: macos-15
+            target: aarch64-apple-darwin
+            asset: polymarket-mcp-rs-macos-aarch64
+            binary: polymarket-mcp-rs
+            archive: tar
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: polymarket-mcp-rs-windows-x86_64
+            binary: polymarket-mcp-rs.exe
+            archive: zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package Unix binary
+        if: matrix.archive == 'tar'
+        shell: bash
+        run: |
+          mkdir stage
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" stage/polymarket-mcp-rs
+          cp README.md LICENSE stage/
+          tar -C stage -czf "${{ matrix.asset }}.tar.gz" polymarket-mcp-rs README.md LICENSE
+      - name: Package Windows binary
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory stage | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}" stage/polymarket-mcp-rs.exe
+          Copy-Item README.md, LICENSE stage/
+          Compress-Archive -Path stage/* -DestinationPath "${{ matrix.asset }}.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}.*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Assemble cross-platform MCP Bundle
+        run: |
+          mkdir -p bundle/server
+          cp packaging/mcpb/manifest.json bundle/manifest.json
+          cp packaging/mcpb/server/launch bundle/server/launch
+          chmod +x bundle/server/launch
+          version="${GITHUB_REF_NAME#v}"
+          jq --arg version "$version" '.version = $version' bundle/manifest.json > bundle/manifest.tmp
+          mv bundle/manifest.tmp bundle/manifest.json
+
+          mkdir extracted
+          tar -xzf dist/polymarket-mcp-rs-linux-x86_64.tar.gz -C extracted
+          cp extracted/polymarket-mcp-rs bundle/server/polymarket-mcp-rs-linux-x86_64
+          rm -rf extracted/*
+          tar -xzf dist/polymarket-mcp-rs-linux-aarch64.tar.gz -C extracted
+          cp extracted/polymarket-mcp-rs bundle/server/polymarket-mcp-rs-linux-aarch64
+          rm -rf extracted/*
+          tar -xzf dist/polymarket-mcp-rs-macos-x86_64.tar.gz -C extracted
+          cp extracted/polymarket-mcp-rs bundle/server/polymarket-mcp-rs-macos-x86_64
+          rm -rf extracted/*
+          tar -xzf dist/polymarket-mcp-rs-macos-aarch64.tar.gz -C extracted
+          cp extracted/polymarket-mcp-rs bundle/server/polymarket-mcp-rs-macos-aarch64
+          unzip -q dist/polymarket-mcp-rs-windows-x86_64.zip -d extracted
+          cp extracted/polymarket-mcp-rs.exe bundle/server/polymarket-mcp-rs.exe
+          chmod +x bundle/server/polymarket-mcp-rs-*
+
+          npx --yes @anthropic-ai/mcpb validate bundle/manifest.json
+          npx --yes @anthropic-ai/mcpb pack bundle dist/polymarket-mcp.mcpb
+      - name: Generate software bill of materials
+        uses: anchore/sbom-action@v0
+        with:
+          path: ./dist
+          format: spdx-json
+          output-file: ./dist/polymarket-mcp-rs.spdx.json
+          upload-artifact: false
+      - name: Generate checksums
+        working-directory: dist
+        run: |
+          for asset in *.tar.gz *.zip *.mcpb *.spdx.json; do
+            sha256sum "$asset" > "$asset.sha256"
+          done
+          sha256sum *.tar.gz *.zip *.mcpb *.spdx.json > SHA256SUMS
+      - name: Attest release artifacts
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.mcpb
+            dist/*.spdx.json
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --generate-notes --verify-tag --title "$GITHUB_REF_NAME"
+      - name: Create MCP Registry metadata
+        run: |
+          mcpb_sha="$(sha256sum dist/polymarket-mcp.mcpb | awk '{print $1}')"
+          version="${GITHUB_REF_NAME#v}"
+          jq -n \
+            --arg version "$version" \
+            --arg sha "$mcpb_sha" \
+            --arg url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/polymarket-mcp.mcpb" \
+            '{
+              "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+              "name": "io.github.beejmaxx/polymarket-mcp",
+              "title": "Polymarket MCP",
+              "description": "Public Polymarket market intelligence, realtime CLOB V2 books, replay, simulation, and safely gated optional trading in one Rust binary.",
+              "repository": {"url": "https://github.com/beejmaxx/polymarket-mcp-rs", "source": "github"},
+              "version": $version,
+              "packages": [{
+                "registryType": "mcpb",
+                "identifier": $url,
+                "fileSha256": $sha,
+                "transport": {"type": "stdio"}
+              }]
+            }' > server.json
+      - name: Publish to the official MCP Registry
+        run: |
+          curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+          ./mcp-publisher login github-oidc
+          ./mcp-publisher publish

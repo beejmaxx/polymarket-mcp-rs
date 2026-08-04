@@ -44,6 +44,12 @@ pub struct RealtimeUpdate {
     pub book: LiveOrderBook,
 }
 
+#[derive(Clone, Debug)]
+pub struct RealtimeEventUpdate {
+    pub watch_id: String,
+    pub event: RealtimeEvent,
+}
+
 #[derive(Clone)]
 pub struct RealtimeService {
     endpoint: Arc<str>,
@@ -51,6 +57,7 @@ pub struct RealtimeService {
     watches: Arc<RwLock<HashMap<String, WatchState>>>,
     next_id: Arc<AtomicU64>,
     updates: broadcast::Sender<RealtimeUpdate>,
+    event_updates: broadcast::Sender<RealtimeEventUpdate>,
 }
 
 impl fmt::Debug for RealtimeService {
@@ -94,6 +101,7 @@ impl RealtimeService {
             watches: Arc::new(RwLock::new(HashMap::new())),
             next_id: Arc::new(AtomicU64::new(1)),
             updates: broadcast::channel(4_096).0,
+            event_updates: broadcast::channel(4_096).0,
         })
     }
 
@@ -144,6 +152,7 @@ impl RealtimeService {
             socks_proxy: self.socks_proxy.clone(),
             watches: Arc::clone(&self.watches),
             updates: self.updates.clone(),
+            event_updates: self.event_updates.clone(),
             cancel: cancel_rx,
         };
         tokio::spawn(task.run());
@@ -226,9 +235,26 @@ impl RealtimeService {
         }
     }
 
+    pub async fn stop_all(&self) -> usize {
+        let states = {
+            let mut watches = self.watches.write().await;
+            watches.drain().map(|(_, state)| state).collect::<Vec<_>>()
+        };
+        let count = states.len();
+        for state in states {
+            let _ = state.cancel.send(true);
+        }
+        count
+    }
+
     #[must_use]
     pub fn subscribe_updates(&self) -> broadcast::Receiver<RealtimeUpdate> {
         self.updates.subscribe()
+    }
+
+    #[must_use]
+    pub fn subscribe_events(&self) -> broadcast::Receiver<RealtimeEventUpdate> {
+        self.event_updates.subscribe()
     }
 
     #[must_use]
@@ -244,6 +270,7 @@ struct WatchTask {
     socks_proxy: Option<Arc<str>>,
     watches: Arc<RwLock<HashMap<String, WatchState>>>,
     updates: broadcast::Sender<RealtimeUpdate>,
+    event_updates: broadcast::Sender<RealtimeEventUpdate>,
     cancel: watch::Receiver<bool>,
 }
 
@@ -435,16 +462,22 @@ impl WatchTask {
     }
 
     async fn push_event(&self, mut event: RealtimeEvent) {
-        let mut states = self.watches.write().await;
-        let Some(state) = states.get_mut(&self.watch_id) else {
-            return;
+        {
+            let mut states = self.watches.write().await;
+            let Some(state) = states.get_mut(&self.watch_id) else {
+                return;
+            };
+            event.sequence = state.next_event_sequence;
+            state.next_event_sequence += 1;
+            if state.recent_events.len() == 1_024 {
+                state.recent_events.pop_front();
+            }
+            state.recent_events.push_back(event.clone());
         };
-        event.sequence = state.next_event_sequence;
-        state.next_event_sequence += 1;
-        if state.recent_events.len() == 1_024 {
-            state.recent_events.pop_front();
-        }
-        state.recent_events.push_back(event);
+        let _ = self.event_updates.send(RealtimeEventUpdate {
+            watch_id: self.watch_id.clone(),
+            event,
+        });
     }
 
     async fn apply_price_change(&self, change: PriceChange, received_at_ms: u64) {
