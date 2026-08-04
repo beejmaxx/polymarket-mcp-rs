@@ -1,0 +1,33 @@
+name: Feature request
+description: Propose a focused capability backed by a real user workflow.
+title: "feature: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: workflow
+    attributes:
+      label: User workflow
+      description: What should an MCP user be able to accomplish that is awkward or impossible today?
+    validations:
+      required: true
+  - type: textarea
+    id: data
+    attributes:
+      label: Data and API source
+      description: Identify the documented Polymarket endpoint or other open source of truth.
+    validations:
+      required: true
+  - type: textarea
+    id: contract
+    attributes:
+      label: Proposed contract
+      description: Suggest inputs, outputs, profile placement, and important failure modes.
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety boundary
+      options:
+        - label: This can be implemented without autonomous trading recommendations.
+          required: true
+        - label: I have identified whether this is public, authenticated read, or account mutation behavior.
+          required: true

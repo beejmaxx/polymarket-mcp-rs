@@ -1,0 +1,42 @@
+name: Bug report
+description: Report reproducible incorrect behavior or an upstream compatibility problem.
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: Do not include private keys, authenticated API credentials, or sensitive wallet exports.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `polymarket-mcp-rs --version`.
+    validations:
+      required: true
+  - type: dropdown
+    id: profile
+    attributes:
+      label: Tool profile
+      options: [research, core, trading, all]
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Doctor output
+      description: Paste `polymarket-mcp-rs doctor --json`. Review it for local paths first.
+      render: json
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Include the tool name, sanitized arguments, result, and expected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, CPU architecture, MCP client, and relevant proxy configuration without credentials.
+    validations:
+      required: true

@@ -125,5 +125,6 @@ Normal tests are offline and launch the compiled executable as a real stdio MCP 
 - [Contract stability](docs/STABILITY.md)
 - [Roadmap](docs/ROADMAP.md)
 - [Contributing](CONTRIBUTING.md)
+- [Launch and demo kit](docs/LAUNCH.md)
 
 This software provides market infrastructure, not trading recommendations or financial advice.
