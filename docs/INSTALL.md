@@ -20,6 +20,26 @@ irm https://raw.githubusercontent.com/beejmaxx/polymarket-mcp-rs/main/scripts/in
 
 The PowerShell installer verifies the archive and adds `%USERPROFILE%\.local\bin` to the user PATH. You can instead download and inspect either installer before running it.
 
+## Package managers
+
+Homebrew on macOS or Linux:
+
+```bash
+brew install beejmaxx/tap/polymarket-mcp-rs
+```
+
+Scoop on Windows:
+
+```powershell
+scoop bucket add beejmaxx https://github.com/beejmaxx/scoop-bucket
+scoop install beejmaxx/polymarket-mcp-rs
+```
+
+Both repositories use the same versioned release archives and SHA-256 hashes as
+the installers. The release also includes validated WinGet manifests for users
+who want to submit or install them locally; an official WinGet Community listing
+requires a separate upstream review.
+
 Validate the installation:
 
 ```bash

@@ -24,6 +24,17 @@ irm https://raw.githubusercontent.com/beejmaxx/polymarket-mcp-rs/main/scripts/in
 polymarket-mcp-rs doctor
 ```
 
+Or use a package manager:
+
+```bash
+brew install beejmaxx/tap/polymarket-mcp-rs
+```
+
+```powershell
+scoop bucket add beejmaxx https://github.com/beejmaxx/scoop-bucket
+scoop install beejmaxx/polymarket-mcp-rs
+```
+
 Then add it to a client:
 
 ```bash
