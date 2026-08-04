@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "polymarket-mcp",
   "display_name": "Polymarket MCP",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Public Polymarket discovery, exact CLOB V2 books, realtime research, replay, simulation, and opt-in trading.",
   "long_description": "A self-contained Rust MCP server for Polymarket. The default research profile requires no credentials and hides every authenticated trading tool. Exact financial values and 256-bit IDs are returned as strings. Optional trading uses a separate profile plus explicit enablement and confirmations.",
   "author": {

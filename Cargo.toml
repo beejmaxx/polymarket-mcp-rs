@@ -1,6 +1,6 @@
 [package]
 name = "polymarket-mcp-rs"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.90"
 description = "A Polymarket market-data, replay, simulation, and opt-in trading MCP server"

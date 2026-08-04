@@ -10,7 +10,7 @@ macOS and Linux:
 curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/beejmaxx/polymarket-mcp-rs/main/scripts/install.sh | sh
 ```
 
-The default destination is `~/.local/bin`. Override it with `POLYMARKET_MCP_INSTALL_DIR`, or pin a release with `POLYMARKET_MCP_VERSION=0.1.0`.
+The default destination is `~/.local/bin`. Override it with `POLYMARKET_MCP_INSTALL_DIR`, or pin a release with `POLYMARKET_MCP_VERSION=0.1.1`.
 
 Windows PowerShell:
 

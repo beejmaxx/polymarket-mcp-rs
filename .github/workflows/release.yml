@@ -119,6 +119,7 @@ jobs:
           rm -rf extracted/*
           tar -xzf dist/polymarket-mcp-rs-macos-aarch64.tar.gz -C extracted
           cp extracted/polymarket-mcp-rs bundle/server/polymarket-mcp-rs-macos-aarch64
+          rm -rf extracted/*
           unzip -q dist/polymarket-mcp-rs-windows-x86_64.zip -d extracted
           cp extracted/polymarket-mcp-rs.exe bundle/server/polymarket-mcp-rs.exe
           chmod +x bundle/server/polymarket-mcp-rs-*
