@@ -125,6 +125,107 @@ jobs:
 
           npx --yes @anthropic-ai/mcpb validate bundle/manifest.json
           npx --yes @anthropic-ai/mcpb pack bundle dist/polymarket-mcp.mcpb
+      - name: Generate package-manager manifests
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          release_base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}"
+          linux_x64_sha="$(sha256sum dist/polymarket-mcp-rs-linux-x86_64.tar.gz | awk '{print $1}')"
+          linux_arm_sha="$(sha256sum dist/polymarket-mcp-rs-linux-aarch64.tar.gz | awk '{print $1}')"
+          macos_x64_sha="$(sha256sum dist/polymarket-mcp-rs-macos-x86_64.tar.gz | awk '{print $1}')"
+          macos_arm_sha="$(sha256sum dist/polymarket-mcp-rs-macos-aarch64.tar.gz | awk '{print $1}')"
+          windows_sha="$(sha256sum dist/polymarket-mcp-rs-windows-x86_64.zip | awk '{print $1}')"
+
+          cat > dist/polymarket-mcp-rs.rb <<EOF
+          class PolymarketMcpRs < Formula
+            desc "Polymarket market intelligence and optional trading over MCP"
+            homepage "https://github.com/beejmaxx/polymarket-mcp-rs"
+            version "${version}"
+            license "MIT"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "${release_base}/polymarket-mcp-rs-macos-aarch64.tar.gz"
+                sha256 "${macos_arm_sha}"
+              else
+                url "${release_base}/polymarket-mcp-rs-macos-x86_64.tar.gz"
+                sha256 "${macos_x64_sha}"
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.arm?
+                url "${release_base}/polymarket-mcp-rs-linux-aarch64.tar.gz"
+                sha256 "${linux_arm_sha}"
+              else
+                url "${release_base}/polymarket-mcp-rs-linux-x86_64.tar.gz"
+                sha256 "${linux_x64_sha}"
+              end
+            end
+
+            def install
+              bin.install "polymarket-mcp-rs"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/polymarket-mcp-rs --version")
+            end
+          end
+          EOF
+
+          jq -n \
+            --arg version "$version" \
+            --arg url "${release_base}/polymarket-mcp-rs-windows-x86_64.zip" \
+            --arg hash "$windows_sha" \
+            '{
+              version: $version,
+              description: "Polymarket market intelligence and optional trading over MCP",
+              homepage: "https://github.com/beejmaxx/polymarket-mcp-rs",
+              license: "MIT",
+              architecture: {"64bit": {url: $url, hash: $hash}},
+              bin: "polymarket-mcp-rs.exe",
+              checkver: {github: "https://github.com/beejmaxx/polymarket-mcp-rs"},
+              autoupdate: {architecture: {"64bit": {url: "https://github.com/beejmaxx/polymarket-mcp-rs/releases/download/v$version/polymarket-mcp-rs-windows-x86_64.zip"}}}
+            }' > dist/polymarket-mcp-rs.scoop.json
+
+          winget_dir="$(mktemp -d)"
+          cat > "$winget_dir/beejmaxx.PolymarketMCP.yaml" <<EOF
+          PackageIdentifier: beejmaxx.PolymarketMCP
+          PackageVersion: ${version}
+          DefaultLocale: en-US
+          ManifestType: version
+          ManifestVersion: 1.12.0
+          EOF
+          cat > "$winget_dir/beejmaxx.PolymarketMCP.locale.en-US.yaml" <<EOF
+          PackageIdentifier: beejmaxx.PolymarketMCP
+          PackageVersion: ${version}
+          PackageLocale: en-US
+          Publisher: beejmaxx
+          PackageName: Polymarket MCP
+          License: MIT
+          ShortDescription: Polymarket market intelligence and optional trading over MCP
+          PackageUrl: https://github.com/beejmaxx/polymarket-mcp-rs
+          LicenseUrl: https://github.com/beejmaxx/polymarket-mcp-rs/blob/v${version}/LICENSE
+          ManifestType: defaultLocale
+          ManifestVersion: 1.12.0
+          EOF
+          cat > "$winget_dir/beejmaxx.PolymarketMCP.installer.yaml" <<EOF
+          PackageIdentifier: beejmaxx.PolymarketMCP
+          PackageVersion: ${version}
+          MinimumOSVersion: 10.0.17763.0
+          InstallerType: zip
+          NestedInstallerType: portable
+          NestedInstallerFiles:
+            - RelativeFilePath: polymarket-mcp-rs.exe
+              PortableCommandAlias: polymarket-mcp-rs
+          Installers:
+            - Architecture: x64
+              InstallerUrl: ${release_base}/polymarket-mcp-rs-windows-x86_64.zip
+              InstallerSha256: ${windows_sha}
+          ManifestType: installer
+          ManifestVersion: 1.12.0
+          EOF
+          (cd "$winget_dir" && zip -q "$GITHUB_WORKSPACE/dist/polymarket-mcp-rs.winget.zip" ./*.yaml)
+          rm -rf "$winget_dir"
       - name: Generate software bill of materials
         uses: anchore/sbom-action@v0
         with:
@@ -135,10 +236,10 @@ jobs:
       - name: Generate checksums
         working-directory: dist
         run: |
-          for asset in *.tar.gz *.zip *.mcpb *.spdx.json; do
+          for asset in ./*.tar.gz ./*.zip ./*.mcpb ./*.rb ./*.json; do
             sha256sum "$asset" > "$asset.sha256"
           done
-          sha256sum *.tar.gz *.zip *.mcpb *.spdx.json > SHA256SUMS
+          sha256sum ./*.tar.gz ./*.zip ./*.mcpb ./*.rb ./*.json > SHA256SUMS
       - name: Attest release artifacts
         uses: actions/attest-build-provenance@v2
         with:
@@ -146,7 +247,8 @@ jobs:
             dist/*.tar.gz
             dist/*.zip
             dist/*.mcpb
-            dist/*.spdx.json
+            dist/*.rb
+            dist/*.json
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
