@@ -2,7 +2,7 @@
 name = "polymarket-mcp-rs"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.90"
 description = "A Polymarket market-data, replay, simulation, and opt-in trading MCP server"
 license = "MIT"
 repository = "https://github.com/beejmaxx/polymarket-mcp-rs"

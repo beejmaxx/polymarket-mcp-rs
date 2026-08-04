@@ -108,7 +108,7 @@ EOA, legacy Proxy, Gnosis Safe, and POLY_1271 configurations are supported. `pre
 
 ## Development and evidence
 
-Rust 1.88 or newer is required:
+Rust 1.90 or newer is required:
 
 ```bash
 cargo fmt --check

@@ -4,7 +4,7 @@ Thanks for helping improve `polymarket-mcp-rs`.
 
 ## Development
 
-Rust 1.88 or newer is required. Before opening a pull request, run:
+Rust 1.90 or newer is required. Before opening a pull request, run:
 
 ```bash
 cargo fmt --check
