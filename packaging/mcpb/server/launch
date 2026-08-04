@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 case "$(uname -s):$(uname -m)" in
   Darwin:x86_64) binary="polymarket-mcp-rs-macos-x86_64" ;;
   Darwin:arm64) binary="polymarket-mcp-rs-macos-aarch64" ;;
