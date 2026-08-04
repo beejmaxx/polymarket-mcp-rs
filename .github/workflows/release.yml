@@ -265,7 +265,7 @@ jobs:
               "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
               "name": "io.github.beejmaxx/polymarket-mcp",
               "title": "Polymarket MCP",
-              "description": "Public Polymarket market intelligence, realtime CLOB V2 books, replay, simulation, and safely gated optional trading in one Rust binary.",
+              "description": "Polymarket market data, live CLOB books, replay, simulation, and opt-in trading in Rust.",
               "repository": {"url": "https://github.com/beejmaxx/polymarket-mcp-rs", "source": "github"},
               "version": $version,
               "packages": [{
