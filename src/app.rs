@@ -11,19 +11,20 @@ use polymarket_client_sdk_v2::{
 use crate::{
     error::AppError,
     polymarket::{CLOB_V2_ENDPOINT, DATA_ENDPOINT, GAMMA_ENDPOINT, PolymarketClient},
-    realtime::{CLOB_WS_ENDPOINT, RealtimeService},
+    realtime::RealtimeService,
     recorder::RecorderService,
-    trading::TradingService,
+    trading::{PreviewParameters, TradingService},
     types::{
-        AccountTradesOutput, BatchPlacedOrdersOutput, CancelOrdersOutput, CompareMarketsOutput,
-        EventDetail, HolderDetail, ListMarketsInput, ListMarketsOutput, ListRecordingsOutput,
-        LiveSnapshotOutput, MarketDetail, MarketHoldersOutput, MarketSummary, OpenOrder,
-        OpenOrdersOutput, OrderBookDetail, OrderBookSnapshot, OrderPreviewOutput, OutcomeDetail,
-        OutcomeHolders, OutcomeQuote, PlacedOrderOutput, PriceHistoryOutput, PriceLevel,
-        PricePoint, RealtimeStatusOutput, RecordingInfo, ReplayMarketOutput, SearchMarketsOutput,
-        ServerStatus, SimulationOutput, StopWatchOutput, TagSummary, TradingStatusOutput,
-        WalletActivity, WalletActivityOutput, WalletPosition, WalletPositionsOutput,
-        WalletRiskOutput, WalletTrade, WalletTradesOutput, WalletValueOutput, WatchInfo,
+        AccountTradesOutput, BalanceAllowanceOutput, BatchPlacedOrdersOutput, CancelOrdersOutput,
+        CompareMarketsOutput, EventDetail, HolderDetail, ListMarketsInput, ListMarketsOutput,
+        ListRecordingsOutput, LiveSnapshotOutput, MarketDetail, MarketHoldersOutput, MarketSummary,
+        OpenOrder, OpenOrdersOutput, OrderApprovalStatusOutput, OrderBookDetail, OrderBookSnapshot,
+        OrderPreviewOutput, OutcomeDetail, OutcomeHolders, OutcomeQuote, PlacedOrderOutput,
+        PreviewOrderInput, PriceHistoryOutput, PriceLevel, PricePoint, RealtimeEventsOutput,
+        RealtimeStatusOutput, RecordingInfo, ReplayMarketOutput, SearchMarketsOutput, ServerStatus,
+        SimulationOutput, StopWatchOutput, TagSummary, TradingStatusOutput, WalletActivity,
+        WalletActivityOutput, WalletPosition, WalletPositionsOutput, WalletRiskOutput, WalletTrade,
+        WalletTradesOutput, WalletValueOutput, WatchInfo,
     },
 };
 
@@ -47,11 +48,12 @@ impl App {
     }
 
     pub fn new_with_database(database_path: PathBuf) -> Result<Self, AppError> {
+        let trading_database_path = database_path.clone();
         Ok(Self {
             client: PolymarketClient::new()?,
             realtime: RealtimeService::new()?,
-            recorder: RecorderService::new(database_path),
-            trading: TradingService::from_environment()?,
+            recorder: RecorderService::new(database_path)?,
+            trading: TradingService::from_environment(trading_database_path)?,
         })
     }
 
@@ -69,7 +71,7 @@ impl App {
             gamma_endpoint: GAMMA_ENDPOINT.to_owned(),
             clob_endpoint: CLOB_V2_ENDPOINT.to_owned(),
             data_endpoint: DATA_ENDPOINT.to_owned(),
-            websocket_endpoint: CLOB_WS_ENDPOINT.to_owned(),
+            websocket_endpoint: self.realtime.endpoint().to_owned(),
             database_path: self.recorder.path().display().to_string(),
         }
     }
@@ -90,7 +92,6 @@ impl App {
             .unwrap_or_default()
             .iter()
             .flat_map(market_summaries)
-            .take(usize::from(limit))
             .collect::<Vec<_>>();
 
         markets.sort_by(|left, right| {
@@ -105,6 +106,7 @@ impl App {
                         .and_then(|value| value.parse::<Decimal>().ok()),
                 )
         });
+        markets.truncate(usize::from(limit));
 
         Ok(SearchMarketsOutput {
             query,
@@ -350,10 +352,12 @@ impl App {
                 "market_ids must contain between 2 and 10 IDs".to_owned(),
             ));
         }
-        let mut markets = Vec::with_capacity(market_ids.len());
-        for market_id in market_ids {
-            markets.push(self.get_market(market_id).await?);
-        }
+        let markets = futures::future::try_join_all(
+            market_ids
+                .into_iter()
+                .map(|market_id| self.get_market(market_id)),
+        )
+        .await?;
         Ok(CompareMarketsOutput {
             count: markets.len(),
             markets,
@@ -514,6 +518,22 @@ impl App {
         self.realtime.status().await
     }
 
+    pub async fn get_realtime_events(
+        &self,
+        watch_id: String,
+        after_sequence: Option<u64>,
+        limit: Option<u16>,
+    ) -> Result<RealtimeEventsOutput, AppError> {
+        let watch_id = validate_nonempty("watch_id", watch_id)?;
+        self.realtime
+            .events(
+                &watch_id,
+                after_sequence.unwrap_or(0),
+                usize::from(limit.unwrap_or(100).clamp(1, 500)),
+            )
+            .await
+    }
+
     pub async fn stop_watching(&self, watch_id: String) -> Result<StopWatchOutput, AppError> {
         let watch_id = validate_nonempty("watch_id", watch_id)?;
         Ok(self.realtime.stop(&watch_id).await)
@@ -538,11 +558,18 @@ impl App {
         self.recorder.stop(&recording_id).await
     }
 
-    pub fn list_recordings(&self, limit: Option<u16>) -> Result<ListRecordingsOutput, AppError> {
-        self.recorder.list(limit.unwrap_or(50).clamp(1, 200))
+    pub async fn list_recordings(
+        &self,
+        limit: Option<u16>,
+    ) -> Result<ListRecordingsOutput, AppError> {
+        let recorder = self.recorder.clone();
+        let limit = limit.unwrap_or(50).clamp(1, 200);
+        tokio::task::spawn_blocking(move || recorder.list(limit))
+            .await
+            .map_err(database_task_error)?
     }
 
-    pub fn replay_market(
+    pub async fn replay_market(
         &self,
         recording_id: String,
         token_id: Option<String>,
@@ -559,13 +586,13 @@ impl App {
         let token_id = token_id
             .map(|value| parse_u256("token_id", &value).map(|id| id.to_string()))
             .transpose()?;
-        self.recorder.replay(
-            &recording_id,
-            token_id.as_deref(),
-            start_ms,
-            end_ms,
-            limit.unwrap_or(100).clamp(1, 5_000),
-        )
+        let recorder = self.recorder.clone();
+        let limit = limit.unwrap_or(100).clamp(1, 5_000);
+        tokio::task::spawn_blocking(move || {
+            recorder.replay(&recording_id, token_id.as_deref(), start_ms, end_ms, limit)
+        })
+        .await
+        .map_err(database_task_error)?
     }
 
     pub async fn simulate_order(
@@ -598,21 +625,31 @@ impl App {
 
     pub async fn preview_order(
         &self,
-        token_id: String,
-        kind: String,
-        side: String,
-        amount: String,
-        price: Option<String>,
-        order_type: Option<String>,
+        input: PreviewOrderInput,
     ) -> Result<OrderPreviewOutput, AppError> {
-        let token_id = parse_u256("token_id", &token_id)?;
-        let amount = parse_decimal("amount", &amount)?;
-        let price = price
+        let token_id = parse_u256("token_id", &input.token_id)?;
+        let amount = parse_decimal("amount", &input.amount)?;
+        let price = input
+            .price
             .as_deref()
             .map(|value| parse_decimal("price", value))
             .transpose()?;
+        let market_rules = if input.live_validation.unwrap_or(true) {
+            let book = self.client.order_book(token_id).await?;
+            Some((book.tick_size.as_decimal(), book.min_order_size))
+        } else {
+            None
+        };
         self.trading
-            .preview(token_id, kind, side, amount, price, order_type)
+            .preview(PreviewParameters {
+                token_id,
+                kind: input.kind,
+                side: input.side,
+                amount,
+                price,
+                order_type: input.order_type,
+                market_rules,
+            })
             .await
     }
 
@@ -623,6 +660,14 @@ impl App {
     ) -> Result<PlacedOrderOutput, AppError> {
         let approval_id = validate_nonempty("approval_id", approval_id)?;
         self.trading.place(&approval_id, confirm).await
+    }
+
+    pub async fn get_order_approval(
+        &self,
+        approval_id: String,
+    ) -> Result<OrderApprovalStatusOutput, AppError> {
+        let approval_id = validate_nonempty("approval_id", approval_id)?;
+        self.trading.approval_status(&approval_id).await
     }
 
     pub async fn place_batch_orders(
@@ -641,23 +686,27 @@ impl App {
     pub async fn list_open_orders(
         &self,
         token_id: Option<String>,
+        next_cursor: Option<String>,
     ) -> Result<OpenOrdersOutput, AppError> {
         let token_id = token_id
             .as_deref()
             .map(|value| parse_u256("token_id", value))
             .transpose()?;
-        self.trading.open_orders(token_id).await
+        let next_cursor = optional_nonempty("next_cursor", next_cursor)?;
+        self.trading.open_orders(token_id, next_cursor).await
     }
 
     pub async fn list_account_trades(
         &self,
         token_id: Option<String>,
+        next_cursor: Option<String>,
     ) -> Result<AccountTradesOutput, AppError> {
         let token_id = token_id
             .as_deref()
             .map(|value| parse_u256("token_id", value))
             .transpose()?;
-        self.trading.account_trades(token_id).await
+        let next_cursor = optional_nonempty("next_cursor", next_cursor)?;
+        self.trading.account_trades(token_id, next_cursor).await
     }
 
     pub async fn cancel_order(
@@ -675,6 +724,47 @@ impl App {
     ) -> Result<CancelOrdersOutput, AppError> {
         self.trading.cancel_all(&confirmation).await
     }
+
+    pub async fn get_balance_allowance(
+        &self,
+        asset_type: String,
+        token_id: Option<String>,
+    ) -> Result<BalanceAllowanceOutput, AppError> {
+        use polymarket_client_sdk_v2::clob::types::AssetType;
+        let asset_type = match asset_type.trim().to_ascii_lowercase().as_str() {
+            "collateral" | "pusd" | "usdc" => AssetType::Collateral,
+            "conditional" | "outcome" => AssetType::Conditional,
+            _ => {
+                return Err(AppError::InvalidInput(
+                    "asset_type must be collateral or conditional".to_owned(),
+                ));
+            }
+        };
+        let token_id = token_id
+            .as_deref()
+            .map(|value| parse_u256("token_id", value))
+            .transpose()?;
+        self.trading.balance_allowance(asset_type, token_id).await
+    }
+
+    pub async fn cancel_market_orders(
+        &self,
+        condition_id: Option<String>,
+        token_id: Option<String>,
+        confirmation: String,
+    ) -> Result<CancelOrdersOutput, AppError> {
+        let condition_id = condition_id
+            .as_deref()
+            .map(|value| parse_b256("condition_id", value))
+            .transpose()?;
+        let token_id = token_id
+            .as_deref()
+            .map(|value| parse_u256("token_id", value))
+            .transpose()?;
+        self.trading
+            .cancel_market(condition_id, token_id, &confirmation)
+            .await
+    }
 }
 
 impl Default for App {
@@ -689,6 +779,19 @@ fn validate_nonempty(field: &str, value: String) -> Result<String, AppError> {
         return Err(AppError::InvalidInput(format!("{field} must not be empty")));
     }
     Ok(value)
+}
+
+fn optional_nonempty(field: &str, value: Option<String>) -> Result<Option<String>, AppError> {
+    value
+        .map(|value| validate_nonempty(field, value))
+        .transpose()
+}
+
+fn database_task_error(error: impl ToString) -> AppError {
+    AppError::Upstream {
+        service: "SQLite recorder",
+        message: error.to_string(),
+    }
 }
 
 fn parse_decimal(field: &str, value: &str) -> Result<Decimal, AppError> {
@@ -1081,28 +1184,36 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let app = App::new_with_database(directory.path().join("preview.sqlite3")).unwrap();
         let preview = app
-            .preview_order(
-                "123".to_owned(),
-                "limit".to_owned(),
-                "buy".to_owned(),
-                "10".to_owned(),
-                Some("0.5".to_owned()),
-                None,
-            )
+            .preview_order(PreviewOrderInput {
+                token_id: "123".to_owned(),
+                kind: "limit".to_owned(),
+                side: "buy".to_owned(),
+                amount: "10".to_owned(),
+                price: Some("0.5".to_owned()),
+                order_type: None,
+                live_validation: Some(false),
+            })
             .await
             .unwrap();
         assert_eq!(preview.maximum_notional_usdc, "5.0");
         assert_eq!(preview.amount_unit, "shares");
+        let approval = app
+            .get_order_approval(preview.approval_id.clone())
+            .await
+            .unwrap();
+        assert_eq!(approval.status, "approved");
+        assert_eq!(approval.token_id, "123");
 
         let error = app
-            .preview_order(
-                "123".to_owned(),
-                "limit".to_owned(),
-                "buy".to_owned(),
-                "1000".to_owned(),
-                Some("0.5".to_owned()),
-                None,
-            )
+            .preview_order(PreviewOrderInput {
+                token_id: "123".to_owned(),
+                kind: "limit".to_owned(),
+                side: "buy".to_owned(),
+                amount: "1000".to_owned(),
+                price: Some("0.5".to_owned()),
+                order_type: None,
+                live_validation: Some(false),
+            })
             .await
             .unwrap_err();
         assert_eq!(error.code(), "invalid_input");

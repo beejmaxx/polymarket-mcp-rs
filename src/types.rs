@@ -145,6 +145,16 @@ pub struct GetLiveSnapshotInput {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetRealtimeEventsInput {
+    #[schemars(description = "Watch ID returned by watch_markets")]
+    pub watch_id: String,
+    #[schemars(description = "Return events after this sequence number")]
+    pub after_sequence: Option<u64>,
+    #[schemars(description = "Maximum events; defaults to 100 and is capped at 500")]
+    pub limit: Option<u16>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct StartRecordingInput {
     #[schemars(
         description = "Active watch ID whose initial and websocket books should be recorded"
@@ -202,6 +212,10 @@ pub struct PreviewOrderInput {
     pub price: Option<String>,
     #[schemars(description = "GTC for limit; FOK or FAK for market; safe defaults apply")]
     pub order_type: Option<String>,
+    #[schemars(
+        description = "Fetch and validate current exchange tick/minimum rules; defaults true"
+    )]
+    pub live_validation: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -211,6 +225,11 @@ pub struct PlaceApprovedOrderInput {
         description = "Must be true; approvals are single-use and expire after five minutes"
     )]
     pub confirm: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ApprovalIdInput {
+    pub approval_id: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -224,11 +243,15 @@ pub struct PlaceBatchOrdersInput {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListOpenOrdersInput {
     pub token_id: Option<String>,
+    #[schemars(description = "Opaque cursor returned by the previous page")]
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListAccountTradesInput {
     pub token_id: Option<String>,
+    #[schemars(description = "Opaque cursor returned by the previous page")]
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -246,6 +269,24 @@ pub struct CancelOrderInput {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct CancelAllOrdersInput {
     #[schemars(description = "Must exactly equal CANCEL_ALL")]
+    pub confirmation: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct BalanceAllowanceInput {
+    #[schemars(description = "collateral for pUSD or conditional for outcome tokens")]
+    pub asset_type: String,
+    #[schemars(description = "Required decimal outcome token ID for conditional assets")]
+    pub token_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CancelMarketOrdersInput {
+    #[schemars(description = "Optional 0x-prefixed condition ID")]
+    pub condition_id: Option<String>,
+    #[schemars(description = "Optional decimal outcome token ID")]
+    pub token_id: Option<String>,
+    #[schemars(description = "Must exactly equal CANCEL_MARKET")]
     pub confirmation: String,
 }
 
@@ -523,7 +564,12 @@ pub struct WatchInfo {
     pub token_ids: Vec<String>,
     pub started_at_ms: u64,
     pub last_update_at_ms: Option<u64>,
+    pub connection_state: String,
     pub update_count: u64,
+    pub rest_seed_count: u64,
+    pub websocket_update_count: u64,
+    pub price_change_count: u64,
+    pub reconnect_count: u64,
     pub error_count: u64,
     pub last_error: Option<String>,
     pub snapshot_count: usize,
@@ -535,6 +581,34 @@ pub struct RealtimeStatusOutput {
     pub active_watch_count: usize,
     pub subscription_count: usize,
     pub watches: Vec<WatchInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct RealtimeEventsOutput {
+    pub watch_id: String,
+    pub count: usize,
+    pub latest_sequence: u64,
+    pub events: Vec<RealtimeEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct RealtimeEvent {
+    pub sequence: u64,
+    pub event_type: String,
+    pub timestamp_ms: i64,
+    pub condition_id: Option<String>,
+    pub token_id: Option<String>,
+    pub price: Option<String>,
+    pub size: Option<String>,
+    pub side: Option<String>,
+    pub best_bid: Option<String>,
+    pub best_ask: Option<String>,
+    pub old_tick_size: Option<String>,
+    pub new_tick_size: Option<String>,
+    pub winning_token_id: Option<String>,
+    pub winning_outcome: Option<String>,
+    pub question: Option<String>,
+    pub slug: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
@@ -576,6 +650,8 @@ pub struct RecordingInfo {
     pub stopped_at_ms: Option<u64>,
     pub snapshot_count: u64,
     pub dropped_update_count: u64,
+    pub writer_error_count: u64,
+    pub last_writer_error: Option<String>,
     pub active: bool,
 }
 
@@ -615,8 +691,25 @@ pub struct TradingStatusOutput {
     pub enabled: bool,
     pub signer_configured: bool,
     pub signer_address: Option<String>,
+    pub signature_type: String,
+    pub funder_address: Option<String>,
+    pub automatic_heartbeats_enabled: bool,
     pub max_order_notional_usdc: String,
     pub safety_model: String,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct BalanceAllowanceOutput {
+    pub asset_type: String,
+    pub token_id: Option<String>,
+    pub balance: String,
+    pub allowances: Vec<ContractAllowance>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct ContractAllowance {
+    pub contract: String,
+    pub allowance: String,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
@@ -631,7 +724,27 @@ pub struct OrderPreviewOutput {
     pub price: Option<String>,
     pub order_type: String,
     pub maximum_notional_usdc: String,
+    pub live_validation_performed: bool,
+    pub current_tick_size: Option<String>,
+    pub current_min_order_size: Option<String>,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct OrderApprovalStatusOutput {
+    pub approval_id: String,
+    pub status: String,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    pub expires_at_ms: u64,
+    pub token_id: String,
+    pub kind: String,
+    pub side: String,
+    pub amount: String,
+    pub price: Option<String>,
+    pub order_type: String,
+    pub order_ids: Vec<String>,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]

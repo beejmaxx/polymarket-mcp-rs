@@ -11,6 +11,17 @@ async fn client_can_initialize_list_tools_and_call_offline_status() {
         service.waiting().await.unwrap();
     });
     let client = ().serve(client_transport).await.unwrap();
+    let peer_info = client
+        .peer()
+        .peer_info()
+        .expect("server initialization info");
+    assert_eq!(
+        peer_info
+            .server_info
+            .as_ref()
+            .map(|info| info.name.as_str()),
+        Some("polymarket-mcp-rs")
+    );
 
     let tools = client.peer().list_tools(None).await.unwrap();
     let mut names = tools
@@ -24,15 +35,19 @@ async fn client_can_initialize_list_tools_and_call_offline_status() {
         [
             "analyze_wallet_risk",
             "cancel_all_orders",
+            "cancel_market_orders",
             "cancel_order",
             "compare_markets",
+            "get_balance_allowance",
             "get_event",
             "get_live_snapshot",
             "get_market",
             "get_market_holders",
             "get_order",
+            "get_order_approval",
             "get_order_book",
             "get_price_history",
+            "get_realtime_events",
             "get_realtime_status",
             "get_wallet_activity",
             "get_wallet_positions",

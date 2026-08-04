@@ -85,7 +85,12 @@ async fn discovery_books_history_and_holders_work_in_production() {
         .await
         .unwrap();
     for _ in 0..40 {
-        if !snapshot.books.is_empty() {
+        if snapshot.watch.websocket_update_count > 0
+            && snapshot
+                .books
+                .iter()
+                .any(|book| book.source.starts_with("websocket"))
+        {
             break;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -96,8 +101,12 @@ async fn discovery_books_history_and_holders_work_in_production() {
     }
     let status = app.get_realtime_status().await;
     assert!(
-        !snapshot.books.is_empty(),
-        "websocket did not deliver an initial book; status: {status:?}"
+        snapshot.watch.websocket_update_count > 0
+            && snapshot
+                .books
+                .iter()
+                .any(|book| book.source.starts_with("websocket")),
+        "websocket did not deliver a genuine update; status: {status:?}"
     );
     assert_eq!(status.active_watch_count, 1);
     let recording = app
@@ -111,6 +120,7 @@ async fn discovery_books_history_and_holders_work_in_production() {
     assert!(stopped_recording.snapshot_count >= 1);
     let replay = app
         .replay_market(recording.recording_id, None, None, None, Some(10))
+        .await
         .unwrap();
     assert!(!replay.books.is_empty());
     let simulation = app

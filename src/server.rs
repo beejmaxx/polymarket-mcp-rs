@@ -1,7 +1,7 @@
 use rmcp::{
     ServerHandler,
     handler::server::wrapper::{Json, Parameters},
-    model::{ServerCapabilities, ServerInfo},
+    model::{Implementation, ServerCapabilities, ServerInfo},
     tool, tool_handler, tool_router,
 };
 
@@ -9,15 +9,17 @@ use crate::{
     App,
     error::AppError,
     types::{
-        AccountTradesOutput, BatchPlacedOrdersOutput, CancelAllOrdersInput, CancelOrderInput,
+        AccountTradesOutput, ApprovalIdInput, BalanceAllowanceInput, BalanceAllowanceOutput,
+        BatchPlacedOrdersOutput, CancelAllOrdersInput, CancelMarketOrdersInput, CancelOrderInput,
         CancelOrdersOutput, CompareMarketsInput, CompareMarketsOutput, EventDetail, GetEventInput,
         GetLiveSnapshotInput, GetMarketHoldersInput, GetMarketInput, GetOrderBookInput,
-        GetPriceHistoryInput, ListAccountTradesInput, ListMarketsInput, ListMarketsOutput,
-        ListOpenOrdersInput, ListRecordingsInput, ListRecordingsOutput, LiveSnapshotOutput,
-        MarketDetail, MarketHoldersOutput, OpenOrder, OpenOrdersOutput, OrderBookDetail,
-        OrderIdInput, OrderPreviewOutput, PlaceApprovedOrderInput, PlaceBatchOrdersInput,
-        PlacedOrderOutput, PreviewOrderInput, PriceHistoryOutput, RealtimeStatusOutput,
-        RecordingIdInput, RecordingInfo, ReplayMarketInput, ReplayMarketOutput, SearchMarketsInput,
+        GetPriceHistoryInput, GetRealtimeEventsInput, ListAccountTradesInput, ListMarketsInput,
+        ListMarketsOutput, ListOpenOrdersInput, ListRecordingsInput, ListRecordingsOutput,
+        LiveSnapshotOutput, MarketDetail, MarketHoldersOutput, OpenOrder, OpenOrdersOutput,
+        OrderApprovalStatusOutput, OrderBookDetail, OrderIdInput, OrderPreviewOutput,
+        PlaceApprovedOrderInput, PlaceBatchOrdersInput, PlacedOrderOutput, PreviewOrderInput,
+        PriceHistoryOutput, RealtimeEventsOutput, RealtimeStatusOutput, RecordingIdInput,
+        RecordingInfo, ReplayMarketInput, ReplayMarketOutput, SearchMarketsInput,
         SearchMarketsOutput, ServerStatus, SimulateOrderInput, SimulationOutput,
         StartRecordingInput, StopWatchOutput, ToolError, TradingStatusOutput, WalletActivityInput,
         WalletActivityOutput, WalletInput, WalletPageInput, WalletPositionsOutput,
@@ -42,7 +44,8 @@ impl PolymarketServer {
 impl PolymarketServer {
     #[tool(
         name = "server_status",
-        description = "Report this server's version, read-only mode, and configured Polymarket API endpoints. This tool makes no network request."
+        description = "Report this server's version, operating mode, database, and configured Polymarket API endpoints. This tool makes no network request.",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
     fn server_status(&self) -> Json<ServerStatus> {
         Json(self.app.status())
@@ -257,7 +260,13 @@ impl PolymarketServer {
 
     #[tool(
         name = "watch_markets",
-        description = "Start a persistent public CLOB websocket watch for one to fifty outcome token IDs. Returns immediately with a watch ID while Rust maintains full books in the background."
+        description = "Start a persistent public CLOB websocket watch for one to fifty outcome token IDs. Returns immediately with a watch ID while Rust maintains full books in the background.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
     )]
     async fn watch_markets(
         &self,
@@ -294,8 +303,30 @@ impl PolymarketServer {
     }
 
     #[tool(
+        name = "get_realtime_events",
+        description = "Read sequenced trade, best-bid/ask, tick-size, new-market, and resolution events retained for an active watch.",
+        annotations(read_only_hint = true, open_world_hint = true)
+    )]
+    async fn get_realtime_events(
+        &self,
+        Parameters(input): Parameters<GetRealtimeEventsInput>,
+    ) -> Result<Json<RealtimeEventsOutput>, Json<ToolError>> {
+        self.app
+            .get_realtime_events(input.watch_id, input.after_sequence, input.limit)
+            .await
+            .map(Json)
+            .map_err(tool_error)
+    }
+
+    #[tool(
         name = "stop_watching",
-        description = "Stop and remove a background market-data watch. Safe and idempotent; stopped is false when the watch no longer exists."
+        description = "Stop and remove a background market-data watch. Safe and idempotent; stopped is false when the watch no longer exists.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn stop_watching(
         &self,
@@ -310,7 +341,13 @@ impl PolymarketServer {
 
     #[tool(
         name = "start_recording",
-        description = "Persist a watch's initial full books and subsequent websocket updates to SQLite. Returns a recording ID; dropped broadcast updates are counted explicitly."
+        description = "Persist a watch's initial full books and subsequent websocket updates to SQLite. Returns a recording ID; dropped broadcast updates are counted explicitly.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn start_recording(
         &self,
@@ -325,7 +362,13 @@ impl PolymarketServer {
 
     #[tool(
         name = "stop_recording",
-        description = "Flush and stop an active SQLite recording, returning final snapshot and dropped-update counts."
+        description = "Flush and stop an active SQLite recording, returning final snapshot and dropped-update counts.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn stop_recording(
         &self,
@@ -342,12 +385,13 @@ impl PolymarketServer {
         name = "list_recordings",
         description = "List local SQLite recordings with token coverage, lifecycle timestamps, snapshot counts, and any detected dropped updates."
     )]
-    fn list_recordings(
+    async fn list_recordings(
         &self,
         Parameters(input): Parameters<ListRecordingsInput>,
     ) -> Result<Json<ListRecordingsOutput>, Json<ToolError>> {
         self.app
             .list_recordings(input.limit)
+            .await
             .map(Json)
             .map_err(tool_error)
     }
@@ -356,7 +400,7 @@ impl PolymarketServer {
         name = "replay_market",
         description = "Replay locally recorded full-book states in deterministic upstream-timestamp order, optionally filtered by token and time range."
     )]
-    fn replay_market(
+    async fn replay_market(
         &self,
         Parameters(input): Parameters<ReplayMarketInput>,
     ) -> Result<Json<ReplayMarketOutput>, Json<ToolError>> {
@@ -368,6 +412,7 @@ impl PolymarketServer {
                 input.end_ms,
                 input.limit,
             )
+            .await
             .map(Json)
             .map_err(tool_error)
     }
@@ -397,21 +442,36 @@ impl PolymarketServer {
 
     #[tool(
         name = "preview_order",
-        description = "Validate a limit or market order against exact decimal rules and the configured notional cap, then issue a single-use five-minute approval. Never places an order."
+        description = "Apply local decimal and notional policy checks to a limit or market order, fetch current tick/minimum rules by default, then issue a single-use five-minute approval. This does not guarantee exchange acceptance or a fill and never places an order.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
     )]
     async fn preview_order(
         &self,
         Parameters(input): Parameters<PreviewOrderInput>,
     ) -> Result<Json<OrderPreviewOutput>, Json<ToolError>> {
         self.app
-            .preview_order(
-                input.token_id,
-                input.kind,
-                input.side,
-                input.amount,
-                input.price,
-                input.order_type,
-            )
+            .preview_order(input)
+            .await
+            .map(Json)
+            .map_err(tool_error)
+    }
+
+    #[tool(
+        name = "get_order_approval",
+        description = "Read the durable lifecycle and result of an order approval, including ambiguous submission failures.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn get_order_approval(
+        &self,
+        Parameters(input): Parameters<ApprovalIdInput>,
+    ) -> Result<Json<OrderApprovalStatusOutput>, Json<ToolError>> {
+        self.app
+            .get_order_approval(input.approval_id)
             .await
             .map(Json)
             .map_err(tool_error)
@@ -419,7 +479,13 @@ impl PolymarketServer {
 
     #[tool(
         name = "place_order",
-        description = "Consume a fresh single-use approval and place its exact signed order. Requires POLYMARKET_ENABLE_TRADING=true, a private key, and confirm=true."
+        description = "Consume a fresh single-use approval and place its exact signed order. Requires POLYMARKET_ENABLE_TRADING=true, a private key, and confirm=true.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
     )]
     async fn place_order(
         &self,
@@ -434,7 +500,13 @@ impl PolymarketServer {
 
     #[tool(
         name = "place_batch_orders",
-        description = "Atomically submit one to ten fresh approved orders. The batch total shares the configured notional cap and requires the exact confirmation PLACE_BATCH."
+        description = "Atomically submit one to ten fresh approved orders. The batch total shares the configured notional cap and requires the exact confirmation PLACE_BATCH.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
     )]
     async fn place_batch_orders(
         &self,
@@ -471,7 +543,7 @@ impl PolymarketServer {
         Parameters(input): Parameters<ListOpenOrdersInput>,
     ) -> Result<Json<OpenOrdersOutput>, Json<ToolError>> {
         self.app
-            .list_open_orders(input.token_id)
+            .list_open_orders(input.token_id, input.next_cursor)
             .await
             .map(Json)
             .map_err(tool_error)
@@ -486,7 +558,23 @@ impl PolymarketServer {
         Parameters(input): Parameters<ListAccountTradesInput>,
     ) -> Result<Json<AccountTradesOutput>, Json<ToolError>> {
         self.app
-            .list_account_trades(input.token_id)
+            .list_account_trades(input.token_id, input.next_cursor)
+            .await
+            .map(Json)
+            .map_err(tool_error)
+    }
+
+    #[tool(
+        name = "get_balance_allowance",
+        description = "Get the authenticated account's pUSD collateral or outcome-token balance and contract allowances.",
+        annotations(read_only_hint = true, open_world_hint = true)
+    )]
+    async fn get_balance_allowance(
+        &self,
+        Parameters(input): Parameters<BalanceAllowanceInput>,
+    ) -> Result<Json<BalanceAllowanceOutput>, Json<ToolError>> {
+        self.app
+            .get_balance_allowance(input.asset_type, input.token_id)
             .await
             .map(Json)
             .map_err(tool_error)
@@ -494,7 +582,13 @@ impl PolymarketServer {
 
     #[tool(
         name = "cancel_order",
-        description = "Cancel one authenticated account order. Requires trading enablement and confirm=true."
+        description = "Cancel one authenticated account order. Requires trading enablement and confirm=true.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
     )]
     async fn cancel_order(
         &self,
@@ -509,7 +603,13 @@ impl PolymarketServer {
 
     #[tool(
         name = "cancel_all_orders",
-        description = "Cancel every authenticated account order. Requires the exact confirmation string CANCEL_ALL."
+        description = "Cancel every authenticated account order. Requires the exact confirmation string CANCEL_ALL.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
     )]
     async fn cancel_all_orders(
         &self,
@@ -521,14 +621,40 @@ impl PolymarketServer {
             .map(Json)
             .map_err(tool_error)
     }
+
+    #[tool(
+        name = "cancel_market_orders",
+        description = "Cancel authenticated orders for one condition, outcome token, or both. Requires the exact confirmation CANCEL_MARKET.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn cancel_market_orders(
+        &self,
+        Parameters(input): Parameters<CancelMarketOrdersInput>,
+    ) -> Result<Json<CancelOrdersOutput>, Json<ToolError>> {
+        self.app
+            .cancel_market_orders(input.condition_id, input.token_id, input.confirmation)
+            .await
+            .map(Json)
+            .map_err(tool_error)
+    }
 }
 
 #[tool_handler]
 impl ServerHandler for PolymarketServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "Read-only access to Polymarket Gamma discovery, Data API public data, and production CLOB V2 market data. Use search_markets or list_markets first, then inspect returned IDs with get_event, get_market, get_order_book, price history, holders, or comparison tools.",
-        )
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new(
+                env!("CARGO_PKG_NAME"),
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .with_instructions(
+                "Polymarket market intelligence and optional authenticated trading. Public discovery, Data API, CLOB V2 books, realtime watches, recording, replay, and simulation are available by default. Trading is disabled unless explicitly enabled, and placement or cancellation tools require confirmation. Use search_markets or list_markets before inspecting IDs or creating a watch.",
+            )
     }
 }
 
@@ -558,15 +684,19 @@ mod tests {
             [
                 "analyze_wallet_risk",
                 "cancel_all_orders",
+                "cancel_market_orders",
                 "cancel_order",
                 "compare_markets",
+                "get_balance_allowance",
                 "get_event",
                 "get_live_snapshot",
                 "get_market",
                 "get_market_holders",
                 "get_order",
+                "get_order_approval",
                 "get_order_book",
                 "get_price_history",
+                "get_realtime_events",
                 "get_realtime_status",
                 "get_wallet_activity",
                 "get_wallet_positions",
@@ -597,5 +727,13 @@ mod tests {
         let Json(error) = tool_error(AppError::InvalidInput("bad query".to_owned()));
         assert_eq!(error.code, "invalid_input");
         assert!(!error.retryable);
+    }
+
+    #[test]
+    fn advertises_project_identity() {
+        let server = PolymarketServer::new(App::new().unwrap());
+        let info = server.get_info();
+        assert_eq!(info.server_info.name, "polymarket-mcp-rs");
+        assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
     }
 }

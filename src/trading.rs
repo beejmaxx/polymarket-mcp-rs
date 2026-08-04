@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     fmt,
+    path::{Path, PathBuf},
     str::FromStr,
     sync::{
         Arc,
@@ -16,22 +17,25 @@ use polymarket_client_sdk_v2::{
     clob::{
         Client as ClobClient, Config as ClobConfig,
         types::{
-            Amount, OrderType, Side, TraderSide,
-            request::{OrdersRequest, TradesRequest},
+            Amount, AssetType, OrderType, Side, SignatureType, SignedOrder, TraderSide,
+            request::{
+                BalanceAllowanceRequest, CancelMarketOrderRequest, OrdersRequest, TradesRequest,
+            },
             response::{CancelOrdersResponse, OpenOrderResponse, PostOrderResponse, TradeResponse},
         },
     },
-    types::{Decimal, U256},
+    types::{Address, B256, Decimal, U256},
 };
+use rusqlite::{Connection, OptionalExtension as _, params};
 use tokio::sync::Mutex;
 
 use crate::{
     error::AppError,
     polymarket::CLOB_V2_ENDPOINT,
     types::{
-        AccountTrade, AccountTradesOutput, BatchPlacedOrdersOutput, CancelFailure,
-        CancelOrdersOutput, OpenOrder, OpenOrdersOutput, OrderPreviewOutput, PlacedOrderOutput,
-        TradingStatusOutput,
+        AccountTrade, AccountTradesOutput, BalanceAllowanceOutput, BatchPlacedOrdersOutput,
+        CancelFailure, CancelOrdersOutput, ContractAllowance, OpenOrder, OpenOrdersOutput,
+        OrderApprovalStatusOutput, OrderPreviewOutput, PlacedOrderOutput, TradingStatusOutput,
     },
 };
 
@@ -41,10 +45,13 @@ type AuthClient = ClobClient<Authenticated<Normal>>;
 pub struct TradingService {
     enabled: bool,
     signer: Option<PrivateKeySigner>,
+    signature_type: SignatureType,
+    funder: Option<Address>,
     max_notional: Decimal,
     approvals: Arc<Mutex<HashMap<String, OrderPlan>>>,
     context: Arc<Mutex<Option<AuthContext>>>,
     next_id: Arc<AtomicU64>,
+    audit_path: PathBuf,
 }
 
 struct AuthContext {
@@ -63,19 +70,31 @@ struct OrderPlan {
     expires_at_ms: u64,
 }
 
+pub(crate) struct PreviewParameters {
+    pub token_id: U256,
+    pub kind: String,
+    pub side: String,
+    pub amount: Decimal,
+    pub price: Option<Decimal>,
+    pub order_type: Option<String>,
+    pub market_rules: Option<(Decimal, Decimal)>,
+}
+
 impl fmt::Debug for TradingService {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("TradingService")
             .field("enabled", &self.enabled)
             .field("signer_configured", &self.signer.is_some())
+            .field("signature_type", &self.signature_type)
+            .field("funder_configured", &self.funder.is_some())
             .field("max_notional", &self.max_notional)
             .finish_non_exhaustive()
     }
 }
 
 impl TradingService {
-    pub fn from_environment() -> Result<Self, AppError> {
+    pub fn from_environment(audit_path: PathBuf) -> Result<Self, AppError> {
         let enabled = std::env::var("POLYMARKET_ENABLE_TRADING")
             .is_ok_and(|value| value.eq_ignore_ascii_case("true"));
         let signer = std::env::var("POLYMARKET_PRIVATE_KEY")
@@ -88,6 +107,30 @@ impl TradingService {
                     })
             })
             .transpose()?;
+        let signature_type = parse_signature_type(
+            &std::env::var("POLYMARKET_SIGNATURE_TYPE").unwrap_or_else(|_| "eoa".to_owned()),
+        )?;
+        let funder = std::env::var("POLYMARKET_FUNDER_ADDRESS")
+            .ok()
+            .map(|value| {
+                Address::from_str(value.trim()).map_err(|error| {
+                    AppError::InvalidInput(format!("invalid POLYMARKET_FUNDER_ADDRESS: {error}"))
+                })
+            })
+            .transpose()?;
+        match (signature_type, funder) {
+            (SignatureType::Eoa, Some(_)) => {
+                return Err(AppError::InvalidInput(
+                    "POLYMARKET_FUNDER_ADDRESS must be omitted for EOA signature type".to_owned(),
+                ));
+            }
+            (SignatureType::Poly1271, None) => {
+                return Err(AppError::InvalidInput(
+                    "POLYMARKET_FUNDER_ADDRESS is required for poly1271 signature type".to_owned(),
+                ));
+            }
+            _ => {}
+        }
         let max_notional = std::env::var("POLYMARKET_MAX_ORDER_USDC")
             .unwrap_or_else(|_| "100".to_owned())
             .parse::<Decimal>()
@@ -102,10 +145,13 @@ impl TradingService {
         Ok(Self {
             enabled,
             signer,
+            signature_type,
+            funder,
             max_notional,
             approvals: Arc::new(Mutex::new(HashMap::new())),
             context: Arc::new(Mutex::new(None)),
             next_id: Arc::new(AtomicU64::new(1)),
+            audit_path,
         })
     }
 
@@ -115,20 +161,27 @@ impl TradingService {
             enabled: self.enabled,
             signer_configured: self.signer.is_some(),
             signer_address: self.signer.as_ref().map(|signer| signer.address().to_string()),
+            signature_type: self.signature_type.to_string(),
+            funder_address: self.funder.map(|address| address.to_string()),
+            automatic_heartbeats_enabled: true,
             max_order_notional_usdc: self.max_notional.to_string(),
             safety_model: "Trading is off unless POLYMARKET_ENABLE_TRADING=true. Placement requires a single-use five-minute preview approval and confirm=true; every order is capped by POLYMARKET_MAX_ORDER_USDC. Cancellation requires separate explicit confirmation.".to_owned(),
         }
     }
 
-    pub async fn preview(
+    pub(crate) async fn preview(
         &self,
-        token_id: U256,
-        kind: String,
-        side: String,
-        amount: Decimal,
-        price: Option<Decimal>,
-        order_type: Option<String>,
+        parameters: PreviewParameters,
     ) -> Result<OrderPreviewOutput, AppError> {
+        let PreviewParameters {
+            token_id,
+            kind,
+            side,
+            amount,
+            price,
+            order_type,
+            market_rules,
+        } = parameters;
         if amount <= Decimal::ZERO {
             return Err(AppError::InvalidInput(
                 "amount must be greater than zero".to_owned(),
@@ -136,7 +189,7 @@ impl TradingService {
         }
         let side = parse_side(&side)?;
         let kind = kind.trim().to_ascii_lowercase();
-        let (order_type, price, amount_unit, notional, warnings) = match kind.as_str() {
+        let (order_type, price, amount_unit, notional, mut warnings) = match kind.as_str() {
             "limit" => {
                 let price = price.ok_or_else(|| {
                     AppError::InvalidInput("price is required for limit orders".to_owned())
@@ -197,6 +250,26 @@ impl TradingService {
                 self.max_notional
             )));
         }
+        if let Some((tick_size, min_order_size)) = market_rules {
+            if kind == "limit" && price.is_some_and(|price| price % tick_size != Decimal::ZERO) {
+                return Err(AppError::InvalidInput(format!(
+                    "limit price must be a multiple of the current tick size {tick_size}"
+                )));
+            }
+            if (kind == "limit" || side == Side::Sell) && amount < min_order_size {
+                return Err(AppError::InvalidInput(format!(
+                    "share amount {amount} is below the current minimum order size {min_order_size}"
+                )));
+            }
+            warnings.push(format!(
+                "Validated against current tick size {tick_size} and minimum order size {min_order_size}."
+            ));
+        } else {
+            warnings.push(
+                "Live exchange-rule validation was explicitly disabled; acceptance is less certain."
+                    .to_owned(),
+            );
+        }
         let expires_at_ms = now_ms().saturating_add(5 * 60 * 1_000);
         let approval_id = format!(
             "approval-{}-{}",
@@ -212,6 +285,7 @@ impl TradingService {
             order_type: order_type.clone(),
             expires_at_ms,
         };
+        insert_approval_audit(&self.audit_path, &approval_id, &plan)?;
         self.approvals
             .lock()
             .await
@@ -227,8 +301,22 @@ impl TradingService {
             price: price.map(|value| value.to_string()),
             order_type: order_type.to_string(),
             maximum_notional_usdc: notional.to_string(),
+            live_validation_performed: market_rules.is_some(),
+            current_tick_size: market_rules.map(|(tick, _)| tick.to_string()),
+            current_min_order_size: market_rules.map(|(_, minimum)| minimum.to_string()),
             warnings,
         })
+    }
+
+    pub async fn approval_status(
+        &self,
+        approval_id: &str,
+    ) -> Result<OrderApprovalStatusOutput, AppError> {
+        let path = self.audit_path.clone();
+        let approval_id = approval_id.to_owned();
+        tokio::task::spawn_blocking(move || read_approval_audit(&path, &approval_id))
+            .await
+            .map_err(trading_audit_error)?
     }
 
     pub async fn place(
@@ -244,19 +332,47 @@ impl TradingService {
             .approvals
             .lock()
             .await
-            .remove(approval_id)
+            .get(approval_id)
+            .cloned()
             .ok_or_else(|| {
                 AppError::InvalidInput(format!("unknown or already-used approval_id {approval_id}"))
             })?;
         if now_ms() > plan.expires_at_ms {
+            set_approval_audit(
+                &self.audit_path,
+                approval_id,
+                "expired",
+                &[],
+                Some("approval expired before submission"),
+            )?;
             return Err(AppError::InvalidInput(
                 "order approval has expired".to_owned(),
             ));
         }
+        transition_approval_audit(&self.audit_path, approval_id, "approved", "validating")?;
         let mut context = self.context.lock().await;
-        self.ensure_authenticated(&mut context).await?;
+        if let Err(error) = self.ensure_authenticated(&mut context).await {
+            set_approval_audit(
+                &self.audit_path,
+                approval_id,
+                "approved",
+                &[],
+                Some(&error.to_string()),
+            )?;
+            return Err(error);
+        }
         let context = context.as_ref().unwrap();
-        let response = if plan.kind == "limit" {
+        if let Err(error) = ensure_not_geoblocked(&context.client).await {
+            set_approval_audit(
+                &self.audit_path,
+                approval_id,
+                "approved",
+                &[],
+                Some(&error.to_string()),
+            )?;
+            return Err(error);
+        }
+        let signable_result = if plan.kind == "limit" {
             context
                 .client
                 .limit_order()
@@ -265,15 +381,28 @@ impl TradingService {
                 .price(plan.price.unwrap())
                 .size(plan.amount)
                 .order_type(plan.order_type)
-                .build_sign_and_post(&context.signer)
+                .build()
                 .await
         } else {
             let amount = if plan.side == Side::Buy {
                 Amount::usdc(plan.amount)
             } else {
                 Amount::shares(plan.amount)
-            }
-            .map_err(trading_error)?;
+            };
+            let amount = match amount {
+                Ok(amount) => amount,
+                Err(error) => {
+                    let error = trading_error(error);
+                    set_approval_audit(
+                        &self.audit_path,
+                        approval_id,
+                        "approved",
+                        &[],
+                        Some(&error.to_string()),
+                    )?;
+                    return Err(error);
+                }
+            };
             context
                 .client
                 .market_order()
@@ -281,11 +410,63 @@ impl TradingService {
                 .side(plan.side)
                 .amount(amount)
                 .order_type(plan.order_type)
-                .build_sign_and_post(&context.signer)
+                .build()
                 .await
-        }
-        .map_err(trading_error)?;
-        Ok(placed_order(response))
+        };
+        let signable = match signable_result {
+            Ok(order) => order,
+            Err(error) => {
+                let error = trading_error(error);
+                set_approval_audit(
+                    &self.audit_path,
+                    approval_id,
+                    "approved",
+                    &[],
+                    Some(&error.to_string()),
+                )?;
+                return Err(error);
+            }
+        };
+        let signed = match context.client.sign(&context.signer, signable).await {
+            Ok(order) => order,
+            Err(error) => {
+                let error = trading_error(error);
+                set_approval_audit(
+                    &self.audit_path,
+                    approval_id,
+                    "approved",
+                    &[],
+                    Some(&error.to_string()),
+                )?;
+                return Err(error);
+            }
+        };
+        set_approval_audit(&self.audit_path, approval_id, "submitting", &[], None)?;
+        let response = match context.client.post_order(signed).await {
+            Ok(response) => response,
+            Err(error) => {
+                let error = trading_error(error);
+                self.approvals.lock().await.remove(approval_id);
+                set_approval_audit(
+                    &self.audit_path,
+                    approval_id,
+                    "unknown",
+                    &[],
+                    Some(&error.to_string()),
+                )?;
+                return Err(error);
+            }
+        };
+        let response = placed_order(response);
+        self.approvals.lock().await.remove(approval_id);
+        set_approval_audit(
+            &self.audit_path,
+            approval_id,
+            "submitted",
+            std::slice::from_ref(&response.order_id),
+            response.error_message.as_deref(),
+        )?;
+        Ok(response)
     }
 
     pub async fn place_batch(
@@ -304,7 +485,7 @@ impl TradingService {
                 "approval_ids must contain between 1 and 10 IDs".to_owned(),
             ));
         }
-        let mut approvals = self.approvals.lock().await;
+        let approvals = self.approvals.lock().await;
         let mut plans = Vec::with_capacity(approval_ids.len());
         for approval_id in &approval_ids {
             if plans
@@ -319,6 +500,13 @@ impl TradingService {
                 AppError::InvalidInput(format!("unknown or already-used approval_id {approval_id}"))
             })?;
             if now_ms() > plan.expires_at_ms {
+                set_approval_audit(
+                    &self.audit_path,
+                    approval_id,
+                    "expired",
+                    &[],
+                    Some("approval expired before batch submission"),
+                )?;
                 return Err(AppError::InvalidInput(format!(
                     "order approval {approval_id} has expired"
                 )));
@@ -334,61 +522,79 @@ impl TradingService {
                 self.max_notional
             )));
         }
-        for (approval_id, _) in &plans {
-            approvals.remove(approval_id);
-        }
         drop(approvals);
+        transition_approval_batch(&self.audit_path, &approval_ids, "approved", "validating")?;
 
         let mut context = self.context.lock().await;
-        self.ensure_authenticated(&mut context).await?;
-        let context = context.as_ref().unwrap();
-        let mut signed_orders = Vec::with_capacity(plans.len());
-        for (_, plan) in plans {
-            let signable = if plan.kind == "limit" {
-                context
-                    .client
-                    .limit_order()
-                    .token_id(plan.token_id)
-                    .side(plan.side)
-                    .price(plan.price.unwrap())
-                    .size(plan.amount)
-                    .order_type(plan.order_type)
-                    .build()
-                    .await
-            } else {
-                let amount = if plan.side == Side::Buy {
-                    Amount::usdc(plan.amount)
-                } else {
-                    Amount::shares(plan.amount)
-                }
-                .map_err(trading_error)?;
-                context
-                    .client
-                    .market_order()
-                    .token_id(plan.token_id)
-                    .side(plan.side)
-                    .amount(amount)
-                    .order_type(plan.order_type)
-                    .build()
-                    .await
-            }
-            .map_err(trading_error)?;
-            signed_orders.push(
-                context
-                    .client
-                    .sign(&context.signer, signable)
-                    .await
-                    .map_err(trading_error)?,
-            );
+        if let Err(error) = self.ensure_authenticated(&mut context).await {
+            set_approval_batch(
+                &self.audit_path,
+                &approval_ids,
+                "approved",
+                Some(&error.to_string()),
+            )?;
+            return Err(error);
         }
-        let orders = context
-            .client
-            .post_orders(signed_orders)
-            .await
-            .map_err(trading_error)?
-            .into_iter()
-            .map(placed_order)
-            .collect::<Vec<_>>();
+        let context = context.as_ref().unwrap();
+        if let Err(error) = ensure_not_geoblocked(&context.client).await {
+            set_approval_batch(
+                &self.audit_path,
+                &approval_ids,
+                "approved",
+                Some(&error.to_string()),
+            )?;
+            return Err(error);
+        }
+        let signed_orders = match build_signed_batch(context, &plans).await {
+            Ok(orders) => orders,
+            Err(error) => {
+                set_approval_batch(
+                    &self.audit_path,
+                    &approval_ids,
+                    "approved",
+                    Some(&error.to_string()),
+                )?;
+                return Err(error);
+            }
+        };
+        set_approval_batch(&self.audit_path, &approval_ids, "submitting", None)?;
+        let responses = match context.client.post_orders(signed_orders).await {
+            Ok(responses) => responses,
+            Err(error) => {
+                let error = trading_error(error);
+                for approval_id in &approval_ids {
+                    self.approvals.lock().await.remove(approval_id);
+                }
+                set_approval_batch(
+                    &self.audit_path,
+                    &approval_ids,
+                    "unknown",
+                    Some(&error.to_string()),
+                )?;
+                return Err(error);
+            }
+        };
+        let orders = responses.into_iter().map(placed_order).collect::<Vec<_>>();
+        for (index, approval_id) in approval_ids.iter().enumerate() {
+            self.approvals.lock().await.remove(approval_id);
+            if let Some(order) = orders.get(index) {
+                set_approval_audit(
+                    &self.audit_path,
+                    approval_id,
+                    "submitted",
+                    std::slice::from_ref(&order.order_id),
+                    order.error_message.as_deref(),
+                )?;
+            } else {
+                set_approval_audit(
+                    &self.audit_path,
+                    approval_id,
+                    "unknown",
+                    &[],
+                    Some("batch response omitted the corresponding order result"),
+                )?;
+            }
+        }
         Ok(BatchPlacedOrdersOutput {
             count: orders.len(),
             orders,
@@ -396,7 +602,7 @@ impl TradingService {
     }
 
     pub async fn order(&self, order_id: &str) -> Result<OpenOrder, AppError> {
-        self.require_enabled()?;
+        self.require_signer()?;
         let mut context = self.context.lock().await;
         self.ensure_authenticated(&mut context).await?;
         let response = context
@@ -409,8 +615,12 @@ impl TradingService {
         Ok(open_order(response))
     }
 
-    pub async fn open_orders(&self, token_id: Option<U256>) -> Result<OpenOrdersOutput, AppError> {
-        self.require_enabled()?;
+    pub async fn open_orders(
+        &self,
+        token_id: Option<U256>,
+        next_cursor: Option<String>,
+    ) -> Result<OpenOrdersOutput, AppError> {
+        self.require_signer()?;
         let mut context = self.context.lock().await;
         self.ensure_authenticated(&mut context).await?;
         let request = OrdersRequest::builder().maybe_asset_id(token_id).build();
@@ -418,7 +628,7 @@ impl TradingService {
             .as_ref()
             .unwrap()
             .client
-            .orders(&request, None)
+            .orders(&request, next_cursor)
             .await
             .map_err(trading_error)?;
         Ok(OpenOrdersOutput {
@@ -431,8 +641,9 @@ impl TradingService {
     pub async fn account_trades(
         &self,
         token_id: Option<U256>,
+        next_cursor: Option<String>,
     ) -> Result<AccountTradesOutput, AppError> {
-        self.require_enabled()?;
+        self.require_signer()?;
         let mut context = self.context.lock().await;
         self.ensure_authenticated(&mut context).await?;
         let request = TradesRequest::builder().maybe_asset_id(token_id).build();
@@ -440,7 +651,7 @@ impl TradingService {
             .as_ref()
             .unwrap()
             .client
-            .trades(&request, None)
+            .trades(&request, next_cursor)
             .await
             .map_err(trading_error)?;
         Ok(AccountTradesOutput {
@@ -490,12 +701,95 @@ impl TradingService {
         Ok(cancel_output(response))
     }
 
+    pub async fn balance_allowance(
+        &self,
+        asset_type: AssetType,
+        token_id: Option<U256>,
+    ) -> Result<BalanceAllowanceOutput, AppError> {
+        self.require_signer()?;
+        if asset_type == AssetType::Conditional && token_id.is_none() {
+            return Err(AppError::InvalidInput(
+                "token_id is required when asset_type is conditional".to_owned(),
+            ));
+        }
+        if asset_type == AssetType::Collateral && token_id.is_some() {
+            return Err(AppError::InvalidInput(
+                "token_id must be omitted when asset_type is collateral".to_owned(),
+            ));
+        }
+        let mut context = self.context.lock().await;
+        self.ensure_authenticated(&mut context).await?;
+        let request = BalanceAllowanceRequest::builder()
+            .asset_type(asset_type.clone())
+            .maybe_token_id(token_id)
+            .build();
+        let response = context
+            .as_ref()
+            .unwrap()
+            .client
+            .balance_allowance(request)
+            .await
+            .map_err(trading_error)?;
+        let mut allowances = response
+            .allowances
+            .into_iter()
+            .map(|(contract, allowance)| ContractAllowance {
+                contract: contract.to_string(),
+                allowance,
+            })
+            .collect::<Vec<_>>();
+        allowances.sort_by(|left, right| left.contract.cmp(&right.contract));
+        Ok(BalanceAllowanceOutput {
+            asset_type: asset_type.to_string(),
+            token_id: token_id.map(|value| value.to_string()),
+            balance: response.balance.to_string(),
+            allowances,
+        })
+    }
+
+    pub async fn cancel_market(
+        &self,
+        condition_id: Option<B256>,
+        token_id: Option<U256>,
+        confirmation: &str,
+    ) -> Result<CancelOrdersOutput, AppError> {
+        self.require_enabled()?;
+        if confirmation != "CANCEL_MARKET" {
+            return Err(AppError::InvalidInput(
+                "confirmation must exactly equal CANCEL_MARKET".to_owned(),
+            ));
+        }
+        if condition_id.is_none() && token_id.is_none() {
+            return Err(AppError::InvalidInput(
+                "provide condition_id, token_id, or both".to_owned(),
+            ));
+        }
+        let mut context = self.context.lock().await;
+        self.ensure_authenticated(&mut context).await?;
+        let request = CancelMarketOrderRequest::builder()
+            .maybe_market(condition_id)
+            .maybe_asset_id(token_id)
+            .build();
+        let response = context
+            .as_ref()
+            .unwrap()
+            .client
+            .cancel_market_orders(&request)
+            .await
+            .map_err(trading_error)?;
+        Ok(cancel_output(response))
+    }
+
     fn require_enabled(&self) -> Result<(), AppError> {
         if !self.enabled {
             return Err(AppError::InvalidInput(
                 "trading is disabled; set POLYMARKET_ENABLE_TRADING=true explicitly".to_owned(),
             ));
         }
+        self.require_signer()
+    }
+
+    fn require_signer(&self) -> Result<(), AppError> {
         if self.signer.is_none() {
             return Err(AppError::InvalidInput(
                 "POLYMARKET_PRIVATE_KEY is not configured".to_owned(),
@@ -520,12 +814,87 @@ impl TradingService {
         )
         .map_err(trading_error)?
         .authentication_builder(&signer)
+        .signature_type(self.signature_type);
+        let client = if let Some(funder) = self.funder {
+            client.funder(funder)
+        } else {
+            client
+        }
         .authenticate()
         .await
         .map_err(trading_error)?;
         *context = Some(AuthContext { client, signer });
         Ok(())
     }
+}
+
+fn parse_signature_type(value: &str) -> Result<SignatureType, AppError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "0" | "eoa" => Ok(SignatureType::Eoa),
+        "1" | "proxy" | "poly_proxy" => Ok(SignatureType::Proxy),
+        "2" | "safe" | "gnosis" | "gnosis_safe" => Ok(SignatureType::GnosisSafe),
+        "3" | "poly1271" | "poly_1271" => Ok(SignatureType::Poly1271),
+        _ => Err(AppError::InvalidInput(
+            "POLYMARKET_SIGNATURE_TYPE must be eoa, proxy, gnosis_safe, or poly1271".to_owned(),
+        )),
+    }
+}
+
+async fn build_signed_batch(
+    context: &AuthContext,
+    plans: &[(String, OrderPlan)],
+) -> Result<Vec<SignedOrder>, AppError> {
+    let mut signed_orders = Vec::with_capacity(plans.len());
+    for (_, plan) in plans {
+        let signable = if plan.kind == "limit" {
+            context
+                .client
+                .limit_order()
+                .token_id(plan.token_id)
+                .side(plan.side)
+                .price(plan.price.unwrap())
+                .size(plan.amount)
+                .order_type(plan.order_type.clone())
+                .build()
+                .await
+        } else {
+            let amount = if plan.side == Side::Buy {
+                Amount::usdc(plan.amount)
+            } else {
+                Amount::shares(plan.amount)
+            }
+            .map_err(trading_error)?;
+            context
+                .client
+                .market_order()
+                .token_id(plan.token_id)
+                .side(plan.side)
+                .amount(amount)
+                .order_type(plan.order_type.clone())
+                .build()
+                .await
+        }
+        .map_err(trading_error)?;
+        signed_orders.push(
+            context
+                .client
+                .sign(&context.signer, signable)
+                .await
+                .map_err(trading_error)?,
+        );
+    }
+    Ok(signed_orders)
+}
+
+async fn ensure_not_geoblocked(client: &AuthClient) -> Result<(), AppError> {
+    let status = client.check_geoblock().await.map_err(trading_error)?;
+    if status.blocked {
+        return Err(AppError::InvalidInput(format!(
+            "trading is unavailable from the detected region {}-{}",
+            status.country, status.region
+        )));
+    }
+    Ok(())
 }
 
 fn parse_side(value: &str) -> Result<Side, AppError> {
@@ -615,6 +984,190 @@ fn trading_error(error: impl ToString) -> AppError {
         service: "CLOB V2 trading API",
         message: error.to_string(),
     }
+}
+
+fn initialize_trading_audit(connection: &Connection) -> Result<(), AppError> {
+    connection
+        .execute_batch(
+            "PRAGMA journal_mode = WAL;
+             CREATE TABLE IF NOT EXISTS order_approval_audit (
+                approval_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                expires_at_ms INTEGER NOT NULL,
+                token_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                side TEXT NOT NULL,
+                amount TEXT NOT NULL,
+                price TEXT,
+                order_type TEXT NOT NULL,
+                order_ids_json TEXT NOT NULL DEFAULT '[]',
+                last_error TEXT
+             );",
+        )
+        .map_err(trading_audit_error)
+}
+
+fn insert_approval_audit(path: &Path, approval_id: &str, plan: &OrderPlan) -> Result<(), AppError> {
+    let connection = Connection::open(path).map_err(trading_audit_error)?;
+    initialize_trading_audit(&connection)?;
+    let created_at_ms = now_ms();
+    connection
+        .execute(
+            "INSERT INTO order_approval_audit (approval_id, status, created_at_ms, updated_at_ms, expires_at_ms, token_id, kind, side, amount, price, order_type) VALUES (?1, 'approved', ?2, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                approval_id,
+                as_i64(created_at_ms),
+                as_i64(plan.expires_at_ms),
+                plan.token_id.to_string(),
+                plan.kind,
+                plan.side.to_string(),
+                plan.amount.to_string(),
+                plan.price.map(|value| value.to_string()),
+                plan.order_type.to_string(),
+            ],
+        )
+        .map_err(trading_audit_error)?;
+    Ok(())
+}
+
+fn transition_approval_audit(
+    path: &Path,
+    approval_id: &str,
+    expected: &str,
+    next: &str,
+) -> Result<(), AppError> {
+    let connection = Connection::open(path).map_err(trading_audit_error)?;
+    initialize_trading_audit(&connection)?;
+    let changed = connection
+        .execute(
+            "UPDATE order_approval_audit SET status = ?3, updated_at_ms = ?4, last_error = NULL WHERE approval_id = ?1 AND status = ?2",
+            params![approval_id, expected, next, as_i64(now_ms())],
+        )
+        .map_err(trading_audit_error)?;
+    if changed != 1 {
+        return Err(AppError::InvalidInput(format!(
+            "approval_id {approval_id} is not in the expected {expected} state"
+        )));
+    }
+    Ok(())
+}
+
+fn transition_approval_batch(
+    path: &Path,
+    approval_ids: &[String],
+    expected: &str,
+    next: &str,
+) -> Result<(), AppError> {
+    let mut connection = Connection::open(path).map_err(trading_audit_error)?;
+    initialize_trading_audit(&connection)?;
+    let transaction = connection.transaction().map_err(trading_audit_error)?;
+    for approval_id in approval_ids {
+        let changed = transaction
+            .execute(
+                "UPDATE order_approval_audit SET status = ?3, updated_at_ms = ?4, last_error = NULL WHERE approval_id = ?1 AND status = ?2",
+                params![approval_id, expected, next, as_i64(now_ms())],
+            )
+            .map_err(trading_audit_error)?;
+        if changed != 1 {
+            return Err(AppError::InvalidInput(format!(
+                "approval_id {approval_id} is not in the expected {expected} state"
+            )));
+        }
+    }
+    transaction.commit().map_err(trading_audit_error)
+}
+
+fn set_approval_audit(
+    path: &Path,
+    approval_id: &str,
+    status: &str,
+    order_ids: &[String],
+    last_error: Option<&str>,
+) -> Result<(), AppError> {
+    let connection = Connection::open(path).map_err(trading_audit_error)?;
+    initialize_trading_audit(&connection)?;
+    let order_ids = serde_json::to_string(order_ids).map_err(trading_audit_error)?;
+    connection
+        .execute(
+            "UPDATE order_approval_audit SET status = ?2, updated_at_ms = ?3, order_ids_json = ?4, last_error = ?5 WHERE approval_id = ?1",
+            params![approval_id, status, as_i64(now_ms()), order_ids, last_error],
+        )
+        .map_err(trading_audit_error)?;
+    Ok(())
+}
+
+fn set_approval_batch(
+    path: &Path,
+    approval_ids: &[String],
+    status: &str,
+    last_error: Option<&str>,
+) -> Result<(), AppError> {
+    let mut connection = Connection::open(path).map_err(trading_audit_error)?;
+    initialize_trading_audit(&connection)?;
+    let transaction = connection.transaction().map_err(trading_audit_error)?;
+    for approval_id in approval_ids {
+        transaction
+            .execute(
+                "UPDATE order_approval_audit SET status = ?2, updated_at_ms = ?3, last_error = ?4 WHERE approval_id = ?1",
+                params![approval_id, status, as_i64(now_ms()), last_error],
+            )
+            .map_err(trading_audit_error)?;
+    }
+    transaction.commit().map_err(trading_audit_error)
+}
+
+fn read_approval_audit(
+    path: &Path,
+    approval_id: &str,
+) -> Result<OrderApprovalStatusOutput, AppError> {
+    let connection = Connection::open(path).map_err(trading_audit_error)?;
+    initialize_trading_audit(&connection)?;
+    connection
+        .query_row(
+            "SELECT approval_id, status, created_at_ms, updated_at_ms, expires_at_ms, token_id, kind, side, amount, price, order_type, order_ids_json, last_error FROM order_approval_audit WHERE approval_id = ?1",
+            [approval_id],
+            |row| {
+                let order_ids: String = row.get(11)?;
+                let order_ids = serde_json::from_str(&order_ids).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        11,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+                Ok(OrderApprovalStatusOutput {
+                    approval_id: row.get(0)?,
+                    status: row.get(1)?,
+                    created_at_ms: row.get::<_, i64>(2)?.max(0) as u64,
+                    updated_at_ms: row.get::<_, i64>(3)?.max(0) as u64,
+                    expires_at_ms: row.get::<_, i64>(4)?.max(0) as u64,
+                    token_id: row.get(5)?,
+                    kind: row.get(6)?,
+                    side: row.get(7)?,
+                    amount: row.get(8)?,
+                    price: row.get(9)?,
+                    order_type: row.get(10)?,
+                    order_ids,
+                    last_error: row.get(12)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(trading_audit_error)?
+        .ok_or_else(|| AppError::InvalidInput(format!("unknown approval_id {approval_id}")))
+}
+
+fn trading_audit_error(error: impl ToString) -> AppError {
+    AppError::Upstream {
+        service: "SQLite trading audit",
+        message: error.to_string(),
+    }
+}
+
+fn as_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
 fn now_ms() -> u64 {
