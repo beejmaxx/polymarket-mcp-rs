@@ -1,53 +1,28 @@
-# Roadmap
+# Roadmap and scope
 
-The project grows in small, reviewable phases. New infrastructure is added only when a working feature requires it.
+## Completed
 
-## Phase 0: foundation — complete
+- Rust MCP server over stdio with typed JSON contracts and structured errors
+- Explicit production Gamma, Data, CLOB REST V2, and CLOB websocket endpoints
+- Discovery, events, market details, full books, history, holders, and comparisons
+- Public wallet positions, valuation, trades, activity, and descriptive risk aggregation
+- Background websocket watches with REST seeding, source labels, timestamps, health, and cancellation
+- SQLite full-book recording with gap counts and deterministic local replay
+- Current-book fill and slippage simulation
+- Disabled-by-default authenticated order preview, single/batch placement, account order/trade reads, and cancellation
+- Offline unit/MCP integration tests and an ignored production smoke suite
 
-- Standalone Rust MCP server over stdio
-- Current `rmcp` and official Polymarket Rust V2 SDK
-- Explicit production CLOB V2 endpoint
-- Structured `server_status`, `search_markets`, and `get_market` tools
-- Typed error responses
-- Offline unit and MCP protocol tests
-- Ignored production API smoke test
+## Sensible follow-ups
 
-## Phase 1: read-only coverage
+- Authenticated user websocket events for immediate order/fill updates
+- Cancel-by-condition/token convenience tool
+- Recorded-book execution backtests across strategies
+- Heartbeat-driven cancel-on-disconnect when the SDK's heartbeat feature is adopted
+- HTTP/SSE transport and OAuth only if a real deployment needs remote multi-user access
 
-Add accurate public-data tools without credentials:
-
-- Event details
-- Full order books
-- Price history
-- Market holders
-- Market comparison
-- Public wallet positions and activity
-
-Prefer composable filters and structured responses over many overlapping tools or generated trading advice.
-
-## Phase 2: market recorder
-
-Add one focused Rust-specific feature set:
-
-- Current CLOB V2 websocket ingestion
-- Locally maintained order books
-- Feed freshness and reconnect health
-- Recording selected markets to SQLite
-- Replay of events observed by this server
-- Fill and slippage simulation against current or recorded books
-
-The recorder will report gaps and uncertainty explicitly. It will not claim complete exchange history when the upstream feed cannot prove continuity.
-
-## Phase 3: optional trading
-
-Trading remains postponed until the read-only and recording paths are reliable. Any future implementation must use CLOB V2 and include order preview, confirmation, idempotency, exposure limits, secret isolation, and audit records.
-
-## Non-goals for the initial project
+## Non-goals
 
 - GraphQL or Apollo Router
-- Web dashboard
-- Multiple Cargo crates or services
-- Autonomous trading recommendations
-- WASM strategies
-- Parquet/DataFusion infrastructure
-
+- Autonomous recommendations, “smart trades,” or portfolio-action advice
+- Claiming locally recorded observations are complete historical exchange data
+- A web dashboard, multi-service workspace, WASM strategies, or DataFusion before a demonstrated need

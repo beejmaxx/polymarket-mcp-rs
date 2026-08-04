@@ -1,80 +1,58 @@
 # polymarket-mcp-rs
 
-A small, read-only MCP server for current Polymarket market discovery and CLOB V2 data, written in Rust.
+A production-oriented Polymarket MCP server in Rust. It covers public discovery, current and historical market data, public wallet analytics, background CLOB books, SQLite recording/replay, fill simulation, and opt-in policy-gated trading.
 
-This is the reviewed Phase 0 foundation for a larger market-recording and replay project. It intentionally does not contain trading, websocket recording, a database, GraphQL, or a web server yet.
+The server uses Polymarket's official Rust V2 SDK and explicitly targets the current production endpoints rather than the SDK's legacy default hostname.
 
-## Current tools
+## What it exposes
 
-- `server_status` — reports the server version, mode, and configured endpoints without making a network request.
-- `search_markets` — searches active events and returns matching markets with stable IDs and outcome-token mappings.
-- `get_market` — fetches one market and summarizes its current CLOB V2 order books.
+- Discovery: `search_markets`, `list_markets`, `get_event`, `get_market`, `compare_markets`
+- Market data: `get_order_book`, `get_price_history`, `get_market_holders`
+- Public wallets: `get_wallet_positions`, `get_wallet_value`, `get_wallet_trades`, `get_wallet_activity`, `analyze_wallet_risk`
+- Realtime: `watch_markets`, `get_live_snapshot`, `get_realtime_status`, `stop_watching`
+- Market lab: `simulate_order`, `start_recording`, `stop_recording`, `list_recordings`, `replay_market`
+- Trading: `trading_status`, `preview_order`, `place_order`, `place_batch_orders`, `get_order`, `list_open_orders`, `list_account_trades`, `cancel_order`, `cancel_all_orders`
 
-All successful tool results are typed JSON. Tool failures contain a machine-readable error code, a readable message, and whether retrying may help.
+All successful results are typed structured JSON. Errors include a stable code, readable message, and retryability flag. Exact financial values and 256-bit identifiers cross the MCP boundary as strings, avoiding JSON floating-point loss.
+
+See [docs/PARITY.md](docs/PARITY.md) for the Python-server capability mapping.
 
 ## Architecture
 
 ```text
-MCP client
-    |
-    v
-server.rs       MCP schemas and thin handlers
-    |
-    v
-app.rs          input validation and use cases
-    |
-    v
-polymarket.rs   official Gamma and CLOB V2 SDK clients
-    |
-    +--> https://gamma-api.polymarket.com
-    `--> https://clob.polymarket.com
+MCP client (stdio)
+        |
+        v
+server.rs          schemas + thin handlers
+        |
+        v
+app.rs             validation + use cases + stable output mapping
+   |          |             |                 |
+   v          v             v                 v
+API clients  realtime.rs  recorder.rs       trading.rs
+Gamma/Data/  WS books     SQLite writer     opt-in signer,
+CLOB REST    + health     + replay          approvals + caps
 ```
 
-The important request path is:
+The websocket service keeps full books inside the process; MCP receives snapshots rather than raw tick streams. A new watch is immediately seeded from CLOB REST and labels that data `rest_seed`. Websocket updates replace it with `websocket` data when connected. Connection state, local receipt time, feed age, errors, and dropped recording updates remain explicit.
 
-1. `main.rs` configures stderr-only logging and starts the stdio transport.
-2. `server.rs` registers tools and converts MCP requests into application calls.
-3. `app.rs` validates inputs and builds stable response types from upstream data.
-4. `polymarket.rs` is the only module that directly uses the external SDK clients.
-5. `types.rs` defines the MCP-facing contract; SDK response structs do not leak through it.
+SQLite writes run on a dedicated writer thread. Replay is ordered by upstream timestamp and insertion ID, and only claims to replay observations captured by this server.
 
-`lib.rs` keeps the application usable from tests or a future transport without turning the project into a multi-crate workspace.
+## Build and verify
 
-## CLOB V2
-
-The server uses `polymarket_client_sdk_v2` and explicitly configures the current production endpoint:
-
-```text
-https://clob.polymarket.com
-```
-
-It does not rely on the SDK's default hostname because SDK releases and examples may retain pre-cutover values. This project is read-only; it does not load wallet credentials or private keys.
-
-## Build and test
-
-The minimum supported Rust version is 1.88.
-
-```bash
-cargo build
-cargo test
-cargo clippy --all-targets --all-features -- -D warnings
-```
-
-The normal tests do not require network access. Run the ignored production smoke test explicitly:
-
-```bash
-cargo test --test live_api -- --ignored --nocapture
-```
-
-## Run over stdio
-
-Build a release binary:
+Rust 1.88 or newer is required.
 
 ```bash
 cargo build --release
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features
+cargo test --test live_api -- --ignored --nocapture
 ```
 
-Example MCP client configuration:
+Normal tests are offline. The ignored suite exercises current production Gamma, Data, CLOB REST, wallet, simulation, watch lifecycle, SQLite recording, and replay paths. It never places an order.
+
+## Run over stdio
 
 ```json
 {
@@ -82,24 +60,31 @@ Example MCP client configuration:
     "polymarket": {
       "command": "/absolute/path/to/polymarket-mcp-rs/target/release/polymarket-mcp-rs",
       "env": {
-        "RUST_LOG": "info"
+        "RUST_LOG": "info",
+        "POLYMARKET_MCP_DB": "/absolute/path/to/polymarket-mcp.sqlite3"
       }
     }
   }
 }
 ```
 
-Logs go to stderr. Stdout is reserved for the MCP protocol.
+Logs go only to stderr; stdout is reserved for MCP. `POLYMARKET_MCP_DB` defaults to `polymarket-mcp.sqlite3` in the process working directory.
 
-## Planned direction
+## Trading safety
 
-After this foundation is reviewed and understood:
+Trading is disabled by default. Merely providing a private key does not enable it. To opt in:
 
-1. Add accurate read-only tools for history, holders, events, and public wallet activity.
-2. Add a current websocket order-book engine.
-3. Record selected markets and feed-health information in SQLite.
-4. Add deterministic replay of locally observed events and fill/slippage simulation.
+```bash
+export POLYMARKET_ENABLE_TRADING=true
+export POLYMARKET_PRIVATE_KEY=0x...
+export POLYMARKET_MAX_ORDER_USDC=100
+```
 
-Live trading remains explicitly out of scope until the read-only and recording paths are reliable.
+The private key is parsed into a signer and never returned by a tool or logged. Authentication is lazy. Order placement uses a two-step flow:
 
-See [docs/ROADMAP.md](docs/ROADMAP.md) for the phased scope and explicit non-goals.
+1. `preview_order` validates type, side, units, exact decimals, and notional policy, then returns a single-use approval that expires after five minutes.
+2. `place_order` consumes that approval and also requires `confirm=true`. Batch placement requires `PLACE_BATCH` and applies the cap to the entire batch.
+
+`cancel_order` requires `confirm=true`; `cancel_all_orders` requires the exact phrase `CANCEL_ALL`. Preview and all read-only tools work while trading remains disabled.
+
+This software provides market infrastructure, not trading recommendations or financial advice.

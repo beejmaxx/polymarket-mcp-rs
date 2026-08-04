@@ -19,7 +19,43 @@ async fn client_can_initialize_list_tools_and_call_offline_status() {
         .map(|tool| tool.name.to_string())
         .collect::<Vec<_>>();
     names.sort();
-    assert_eq!(names, ["get_market", "search_markets", "server_status"]);
+    assert_eq!(
+        names,
+        [
+            "analyze_wallet_risk",
+            "cancel_all_orders",
+            "cancel_order",
+            "compare_markets",
+            "get_event",
+            "get_live_snapshot",
+            "get_market",
+            "get_market_holders",
+            "get_order",
+            "get_order_book",
+            "get_price_history",
+            "get_realtime_status",
+            "get_wallet_activity",
+            "get_wallet_positions",
+            "get_wallet_trades",
+            "get_wallet_value",
+            "list_account_trades",
+            "list_markets",
+            "list_open_orders",
+            "list_recordings",
+            "place_batch_orders",
+            "place_order",
+            "preview_order",
+            "replay_market",
+            "search_markets",
+            "server_status",
+            "simulate_order",
+            "start_recording",
+            "stop_recording",
+            "stop_watching",
+            "trading_status",
+            "watch_markets"
+        ]
+    );
 
     let status = client
         .peer()

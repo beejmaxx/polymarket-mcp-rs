@@ -3,21 +3,26 @@ name = "polymarket-mcp-rs"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-description = "A read-only Polymarket CLOB V2 MCP server"
+description = "A Polymarket market-data, replay, simulation, and opt-in trading MCP server"
 license = "MIT"
 repository = "https://github.com/beejmaxx/polymarket-mcp-rs"
 
 [dependencies]
-polymarket_client_sdk_v2 = { version = "0.7.0", features = ["clob", "gamma"] }
+alloy = { version = "1.6.3", default-features = false, features = ["signer-local", "signers"] }
+futures = "0.3"
+polymarket_client_sdk_v2 = { version = "0.7.0", features = ["clob", "data", "gamma", "ws"] }
 rmcp = { version = "3.1.0", features = ["transport-io"] }
+rusqlite = { version = "0.38", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["io-std", "macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["io-std", "macros", "rt-multi-thread", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 rmcp = { version = "3.1.0", features = ["client"] }
+tempfile = "3"
 
 [profile.release]
 lto = "thin"
