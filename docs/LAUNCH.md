@@ -4,13 +4,13 @@ Use these drafts only after the release links, checksums, MCP Registry entry, an
 
 ## GitHub release summary
 
-Polymarket MCP is a self-contained Rust server with 39 tools for public market discovery, exact CLOB V2 books, wallet analytics, realtime local book reconstruction, SQLite recording/replay, fill simulation, and carefully gated optional trading.
+Polymarket MCP is a self-contained Rust server with 46 tools for public market discovery, source-linked research briefs, exact CLOB V2 books, wallet analytics, realtime local book reconstruction, SQLite recording/replay, fill simulation, authenticated user events, and carefully gated optional trading.
 
-The default credential-free research profile exposes 27 tools and removes all authenticated routes from MCP discovery and dispatch. Release assets cover macOS Intel/Apple Silicon, Linux x86-64/ARM64, and Windows x86-64, with a portable MCP Bundle, SHA-256 checksums, an SPDX SBOM, and GitHub provenance.
+The default credential-free research profile exposes 30 tools and removes all authenticated routes from MCP discovery and dispatch. A separate 11-tool hosted profile supports Streamable HTTP and an optional inline MCP Apps card. Release assets cover macOS Intel/Apple Silicon, Linux x86-64/ARM64, and Windows x86-64, with a portable MCP Bundle, SHA-256 checksums, an SPDX SBOM, and GitHub provenance.
 
 ## Short announcement
 
-I released Polymarket MCP, an open-source Rust MCP server that goes beyond wrapping REST endpoints: it reconstructs live CLOB books, exposes feed health and exact-decimal microstructure, records/replays local observations, and simulates execution. The default profile needs no key or wallet and hides every trading tool. One binary, 39 tools total, five release targets, and a one-click MCPB.
+I released Polymarket MCP, an open-source Rust MCP server that goes beyond wrapping REST endpoints: it reconstructs live CLOB books, exposes feed health and exact-decimal microstructure, records/replays local observations, and produces source-linked market briefs with execution simulation. The default profile needs no key or wallet and hides every trading tool. One binary, 46 tools total, five release targets, Streamable HTTP, and a one-click MCPB.
 
 Repository: https://github.com/beejmaxx/polymarket-mcp-rs
 
@@ -18,7 +18,7 @@ Repository: https://github.com/beejmaxx/polymarket-mcp-rs
 
 I wanted a Polymarket MCP server that was useful as infrastructure, not just a long list of thin API wrappers. The Rust process maintains concurrent WebSocket books internally and gives the model compact snapshots, exact-decimal analysis, explicit feed age/errors, deterministic local replay, and current-book fill simulation.
 
-The main design boundary is safety: `research` is the default 27-tool allowlist. Trading routes are absent from `tools/list` and rejected by dispatch unless a user chooses `trading` or `all`; mutation still has a second enablement gate, single-use approvals, caps, and confirmations.
+The main design boundary is safety: `research` is the default 30-tool local allowlist, while public HTTP accepts only credential-blind `chatgpt` or `core`. Trading routes are absent from `tools/list` and rejected by dispatch unless a local user chooses `trading` or `all`; mutation still has a second enablement gate, single-use approvals, caps, and confirmations.
 
 I also published the boring-but-important parts: real compiled-stdio MCP tests, live read-only canaries, golden catalogs, checksum-verified installers, five native binaries, MCPB, SBOM, and provenance. Feedback on tool contracts and real research workflows is welcome.
 

@@ -28,7 +28,7 @@ impl AppError {
                 "Gamma API" => "gamma_api_error",
                 "CLOB V2 API" => "clob_v2_api_error",
                 "Data API" => "data_api_error",
-                "CLOB WebSocket" => "websocket_error",
+                "CLOB WebSocket" | "CLOB user WebSocket" => "websocket_error",
                 "SQLite recorder" => "recording_database_error",
                 "SQLite trading audit" => "trading_audit_error",
                 "CLOB V2 trading API" => "trading_api_error",

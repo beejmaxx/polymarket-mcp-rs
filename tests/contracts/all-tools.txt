@@ -1,3 +1,4 @@
+analyze_event_consistency
 analyze_order_book
 analyze_wallet_risk
 cancel_all_orders
@@ -8,6 +9,7 @@ get_balance_allowance
 get_event
 get_live_snapshot
 get_market
+get_market_brief
 get_market_holders
 get_order
 get_order_approval
@@ -15,8 +17,11 @@ get_order_book
 get_price_history
 get_realtime_events
 get_realtime_status
+get_user_events
+get_user_realtime_status
 get_wallet_activity
 get_wallet_positions
+get_wallet_summary
 get_wallet_trades
 get_wallet_value
 list_account_trades
@@ -34,6 +39,8 @@ server_status
 simulate_order
 start_recording
 stop_recording
+stop_user_watch
 stop_watching
 trading_status
 watch_markets
+watch_user_events

@@ -45,8 +45,8 @@ enum WriterCommand {
 
 impl RecorderService {
     pub fn new(path: PathBuf) -> Result<Self, AppError> {
-        initialize(&path)?;
         let connection = Connection::open(&path).map_err(database_error)?;
+        initialize_connection(&connection)?;
         connection
             .execute(
                 "UPDATE recordings SET active = 0, stopped_at_ms = ?1, writer_error_count = writer_error_count + 1, last_writer_error = 'recording interrupted by a previous server shutdown' WHERE active = 1",
@@ -472,6 +472,10 @@ fn insert_event(
 
 fn initialize(path: &Path) -> Result<(), AppError> {
     let connection = Connection::open(path).map_err(database_error)?;
+    initialize_connection(&connection)
+}
+
+fn initialize_connection(connection: &Connection) -> Result<(), AppError> {
     connection
         .execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -520,22 +524,22 @@ fn initialize(path: &Path) -> Result<(), AppError> {
         )
         .map_err(database_error)?;
     ensure_column(
-        &connection,
+        connection,
         "event_count",
         "ALTER TABLE recordings ADD COLUMN event_count INTEGER NOT NULL DEFAULT 0",
     )?;
     ensure_column(
-        &connection,
+        connection,
         "dropped_event_count",
         "ALTER TABLE recordings ADD COLUMN dropped_event_count INTEGER NOT NULL DEFAULT 0",
     )?;
     ensure_column(
-        &connection,
+        connection,
         "writer_error_count",
         "ALTER TABLE recordings ADD COLUMN writer_error_count INTEGER NOT NULL DEFAULT 0",
     )?;
     ensure_column(
-        &connection,
+        connection,
         "last_writer_error",
         "ALTER TABLE recordings ADD COLUMN last_writer_error TEXT",
     )?;
@@ -641,6 +645,8 @@ mod tests {
                 rest_seed_count: 1,
                 websocket_update_count: 0,
                 price_change_count: 0,
+                retained_event_count: 0,
+                dropped_event_count: 0,
                 reconnect_count: 0,
                 error_count: 0,
                 last_error: None,

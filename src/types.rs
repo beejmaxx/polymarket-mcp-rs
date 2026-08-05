@@ -2,6 +2,7 @@ use rmcp::{schemars, schemars::JsonSchema};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SearchMarketsInput {
     #[schemars(description = "Words from the event title, market question, or topic")]
     pub query: String,
@@ -11,6 +12,7 @@ pub struct SearchMarketsInput {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GetMarketInput {
     #[schemars(description = "Gamma market ID; provide exactly one market identifier")]
     pub market_id: Option<String>,
@@ -23,26 +25,36 @@ pub struct GetMarketInput {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListMarketsInput {
     #[schemars(description = "Maximum markets to return; defaults to 25 and is capped at 100")]
     pub limit: Option<u16>,
-    #[schemars(description = "Number of events to skip; defaults to zero")]
+    #[schemars(
+        description = "Number of matching markets to skip; defaults to zero and is capped at 10000"
+    )]
     pub offset: Option<u32>,
     #[schemars(description = "Optional Gamma topic tag slug, such as politics or crypto")]
     pub tag_slug: Option<String>,
-    #[schemars(description = "Include only featured events when true")]
+    #[schemars(description = "Include only featured markets when true")]
     pub featured: Option<bool>,
-    #[schemars(description = "Minimum event liquidity as an exact decimal string")]
+    #[schemars(description = "Minimum market liquidity as an exact decimal string")]
     pub min_liquidity: Option<String>,
-    #[schemars(description = "Minimum event volume as an exact decimal string")]
+    #[schemars(description = "Minimum all-time market volume as an exact decimal string")]
     pub min_volume: Option<String>,
-    #[schemars(description = "Sort field: volume_24h, volume, liquidity, start_date, or end_date")]
+    #[schemars(
+        description = "Sort field: volume_24h, volume_7d, volume_30d, volume, liquidity, start_date, or end_date"
+    )]
     pub sort_by: Option<String>,
     #[schemars(description = "Sort in ascending order; defaults to false")]
     pub ascending: Option<bool>,
+    #[schemars(description = "Optional inclusive RFC3339 lower bound for market end time")]
+    pub end_after: Option<String>,
+    #[schemars(description = "Optional inclusive RFC3339 upper bound for market end time")]
+    pub end_before: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GetEventInput {
     #[schemars(description = "Gamma event ID; provide either event_id or slug")]
     pub event_id: Option<String>,
@@ -51,6 +63,7 @@ pub struct GetEventInput {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GetOrderBookInput {
     #[schemars(description = "Decimal CLOB outcome token ID")]
     pub token_id: String,
@@ -61,6 +74,7 @@ pub struct GetOrderBookInput {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AnalyzeOrderBookInput {
     #[schemars(description = "Decimal CLOB outcome token ID")]
     pub token_id: String,
@@ -79,6 +93,7 @@ pub struct AnalyzeOrderBookInput {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ScanMarketMicrostructureInput {
     #[schemars(
         description = "Maximum active markets to inspect; defaults to 10 and is capped at 20"
@@ -99,6 +114,7 @@ pub struct ScanMarketMicrostructureInput {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GetPriceHistoryInput {
     #[schemars(description = "Decimal CLOB outcome token ID")]
     pub token_id: String,
@@ -114,9 +130,14 @@ pub struct GetPriceHistoryInput {
     pub end_ts: Option<i64>,
     #[schemars(description = "Sampling fidelity in minutes")]
     pub fidelity: Option<u32>,
+    #[schemars(
+        description = "Maximum points returned after sampling; defaults to 250 and is capped at 1000"
+    )]
+    pub limit: Option<u16>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GetMarketHoldersInput {
     #[schemars(description = "0x-prefixed market condition ID")]
     pub condition_id: String,
@@ -127,12 +148,51 @@ pub struct GetMarketHoldersInput {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CompareMarketsInput {
     #[schemars(description = "Two to ten Gamma market IDs")]
     pub market_ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GetMarketBriefInput {
+    #[schemars(description = "Gamma market ID; provide exactly one market identifier")]
+    pub market_id: Option<String>,
+    #[schemars(description = "Gamma market slug; provide exactly one market identifier")]
+    pub slug: Option<String>,
+    #[schemars(description = "0x-prefixed condition ID; provide exactly one market identifier")]
+    pub condition_id: Option<String>,
+    #[schemars(description = "Outcome shares used for executable fill estimates; defaults to 100")]
+    pub sample_shares: Option<String>,
+    #[schemars(description = "Price-history range: 1m, 1h, 6h, 1d, 1w, or max; defaults to 1d")]
+    pub history_interval: Option<String>,
+    #[schemars(description = "Maximum history points per outcome; defaults to 50, capped at 250")]
+    pub history_limit: Option<u16>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WalletSummaryInput {
+    #[schemars(description = "0x-prefixed public Polymarket proxy-wallet address")]
+    pub wallet: String,
+    #[schemars(
+        description = "Maximum recent trades and activities; defaults to 20, capped at 100"
+    )]
+    pub recent_limit: Option<u16>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AnalyzeEventConsistencyInput {
+    #[schemars(description = "Gamma event ID; provide either event_id or slug")]
+    pub event_id: Option<String>,
+    #[schemars(description = "Gamma event slug; provide either slug or event_id")]
+    pub slug: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct WalletPageInput {
     #[schemars(description = "0x-prefixed public Polymarket proxy-wallet address")]
     pub wallet: String,
@@ -143,6 +203,7 @@ pub struct WalletPageInput {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct WalletActivityInput {
     #[schemars(description = "0x-prefixed public Polymarket proxy-wallet address")]
     pub wallet: String,
@@ -157,24 +218,55 @@ pub struct WalletActivityInput {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct WalletInput {
     #[schemars(description = "0x-prefixed public Polymarket proxy-wallet address")]
     pub wallet: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct WatchMarketsInput {
     #[schemars(description = "One to fifty decimal CLOB outcome token IDs")]
     pub token_ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WatchUserEventsInput {
+    #[schemars(
+        description = "One to fifty 0x-prefixed condition IDs whose authenticated order and trade events should be watched"
+    )]
+    pub condition_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GetUserEventsInput {
+    #[schemars(description = "User watch ID returned by watch_user_events")]
+    pub watch_id: String,
+    #[schemars(description = "Return events after this sequence; defaults to zero")]
+    pub after_sequence: Option<u64>,
+    #[schemars(description = "Maximum events to return; defaults to 100 and is capped at 500")]
+    pub limit: Option<u16>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UserWatchIdInput {
+    #[schemars(description = "User watch ID returned by watch_user_events")]
+    pub watch_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct WatchIdInput {
     #[schemars(description = "Watch ID returned by watch_markets")]
     pub watch_id: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GetLiveSnapshotInput {
     #[schemars(description = "Watch ID returned by watch_markets")]
     pub watch_id: String,
@@ -183,6 +275,7 @@ pub struct GetLiveSnapshotInput {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GetRealtimeEventsInput {
     #[schemars(description = "Watch ID returned by watch_markets")]
     pub watch_id: String,
@@ -193,6 +286,7 @@ pub struct GetRealtimeEventsInput {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct StartRecordingInput {
     #[schemars(
         description = "Active watch ID whose initial and websocket books should be recorded"
@@ -203,18 +297,21 @@ pub struct StartRecordingInput {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RecordingIdInput {
     #[schemars(description = "Recording ID returned by start_recording")]
     pub recording_id: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListRecordingsInput {
     #[schemars(description = "Maximum recordings to return; defaults to 50, capped at 200")]
     pub limit: Option<u16>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ReplayMarketInput {
     pub recording_id: String,
     #[schemars(description = "Optional decimal token ID filter")]
@@ -228,6 +325,7 @@ pub struct ReplayMarketInput {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ReplayEventsInput {
     #[schemars(description = "Recording ID returned by start_recording")]
     pub recording_id: String,
@@ -242,6 +340,7 @@ pub struct ReplayEventsInput {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SimulateOrderInput {
     #[schemars(description = "Decimal CLOB outcome token ID")]
     pub token_id: String,
@@ -252,13 +351,14 @@ pub struct SimulateOrderInput {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PreviewOrderInput {
     pub token_id: String,
     #[schemars(description = "limit or market")]
     pub kind: String,
     #[schemars(description = "buy or sell")]
     pub side: String,
-    #[schemars(description = "Limit shares; market-buy USDC; market-sell shares")]
+    #[schemars(description = "Limit shares; market-buy pUSD; market-sell shares")]
     pub amount: String,
     #[schemars(description = "Required exact decimal price for limit orders")]
     pub price: Option<String>,
@@ -271,6 +371,7 @@ pub struct PreviewOrderInput {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PlaceApprovedOrderInput {
     pub approval_id: String,
     #[schemars(
@@ -280,11 +381,13 @@ pub struct PlaceApprovedOrderInput {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ApprovalIdInput {
     pub approval_id: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PlaceBatchOrdersInput {
     #[schemars(description = "One to ten fresh approval IDs")]
     pub approval_ids: Vec<String>,
@@ -293,6 +396,7 @@ pub struct PlaceBatchOrdersInput {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListOpenOrdersInput {
     pub token_id: Option<String>,
     #[schemars(description = "Opaque cursor returned by the previous page")]
@@ -300,6 +404,7 @@ pub struct ListOpenOrdersInput {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListAccountTradesInput {
     pub token_id: Option<String>,
     #[schemars(description = "Opaque cursor returned by the previous page")]
@@ -307,11 +412,13 @@ pub struct ListAccountTradesInput {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct OrderIdInput {
     pub order_id: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CancelOrderInput {
     pub order_id: String,
     #[schemars(description = "Must be true")]
@@ -319,12 +426,14 @@ pub struct CancelOrderInput {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CancelAllOrdersInput {
     #[schemars(description = "Must exactly equal CANCEL_ALL")]
     pub confirmation: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct BalanceAllowanceInput {
     #[schemars(description = "collateral for pUSD or conditional for outcome tokens")]
     pub asset_type: String,
@@ -333,6 +442,7 @@ pub struct BalanceAllowanceInput {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CancelMarketOrdersInput {
     #[schemars(description = "Optional 0x-prefixed condition ID")]
     pub condition_id: Option<String>,
@@ -359,12 +469,14 @@ pub struct ServerStatus {
 
 #[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct ListMarketsOutput {
+    pub as_of_ms: u64,
     pub count: usize,
     pub markets: Vec<MarketSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct EventDetail {
+    pub as_of_ms: u64,
     pub event_id: String,
     pub title: Option<String>,
     pub slug: Option<String>,
@@ -380,6 +492,8 @@ pub struct EventDetail {
     pub liquidity: Option<String>,
     pub tags: Vec<TagSummary>,
     pub markets: Vec<MarketSummary>,
+    pub polymarket_url: Option<String>,
+    pub gamma_url: String,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
@@ -391,6 +505,7 @@ pub struct TagSummary {
 
 #[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct SearchMarketsOutput {
+    pub as_of_ms: u64,
     pub query: String,
     pub count: usize,
     pub markets: Vec<MarketSummary>,
@@ -400,6 +515,7 @@ pub struct SearchMarketsOutput {
 pub struct MarketSummary {
     pub event_id: String,
     pub event_title: Option<String>,
+    pub event_slug: Option<String>,
     pub market_id: String,
     pub question: Option<String>,
     pub slug: Option<String>,
@@ -408,15 +524,21 @@ pub struct MarketSummary {
     pub accepting_orders: Option<bool>,
     pub end_date: Option<String>,
     pub volume_24h: Option<String>,
+    pub volume_7d: Option<String>,
+    pub volume_30d: Option<String>,
     pub liquidity: Option<String>,
     pub outcomes: Vec<OutcomeQuote>,
+    pub polymarket_url: Option<String>,
+    pub gamma_url: String,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct MarketDetail {
+    pub as_of_ms: u64,
     pub market_id: String,
     pub event_id: Option<String>,
     pub event_title: Option<String>,
+    pub event_slug: Option<String>,
     pub question: Option<String>,
     pub slug: Option<String>,
     pub description: Option<String>,
@@ -430,6 +552,99 @@ pub struct MarketDetail {
     pub volume_24h: Option<String>,
     pub liquidity: Option<String>,
     pub outcomes: Vec<OutcomeDetail>,
+    pub polymarket_url: Option<String>,
+    pub gamma_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct SourceReference {
+    pub name: String,
+    pub url: String,
+    pub scope: String,
+    pub retrieved_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct MarketBriefOutput {
+    pub as_of_ms: u64,
+    pub market: MarketDetail,
+    pub outcome_research: Vec<MarketBriefOutcome>,
+    pub sources: Vec<SourceReference>,
+    pub limitations: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct MarketBriefOutcome {
+    pub outcome: String,
+    pub token_id: Option<String>,
+    pub gamma_price: Option<String>,
+    pub analysis: Option<OrderBookAnalysisOutput>,
+    pub history: Option<PriceHistorySummary>,
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct PriceHistorySummary {
+    pub interval: String,
+    pub point_count: usize,
+    pub first_timestamp: Option<i64>,
+    pub last_timestamp: Option<i64>,
+    pub first_price: Option<String>,
+    pub last_price: Option<String>,
+    pub minimum_price: Option<String>,
+    pub maximum_price: Option<String>,
+    pub absolute_change: Option<String>,
+    pub percent_change: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct WalletSummaryOutput {
+    pub as_of_ms: u64,
+    pub wallet: String,
+    pub positions: WalletPositionsOutput,
+    pub value: WalletValueOutput,
+    pub risk: WalletRiskOutput,
+    pub recent_trades: WalletTradesOutput,
+    pub recent_activity: WalletActivityOutput,
+    pub sources: Vec<SourceReference>,
+    pub limitations: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct EventConsistencyOutput {
+    pub as_of_ms: u64,
+    pub event_id: String,
+    pub event_title: Option<String>,
+    pub event_slug: Option<String>,
+    pub polymarket_url: Option<String>,
+    pub explicit_negative_risk: bool,
+    pub eligible_for_basket_math: bool,
+    pub legs: Vec<EventConsistencyLeg>,
+    pub best_ask_sum: Option<String>,
+    pub buy_all_gross_edge_per_basket: Option<String>,
+    pub buy_all_top_level_capacity: Option<String>,
+    pub best_bid_sum: Option<String>,
+    pub sell_all_gross_edge_per_basket: Option<String>,
+    pub sell_all_top_level_capacity: Option<String>,
+    pub sources: Vec<SourceReference>,
+    pub methodology: String,
+    pub limitations: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct EventConsistencyLeg {
+    pub market_id: String,
+    pub question: Option<String>,
+    pub market_slug: Option<String>,
+    pub polymarket_url: Option<String>,
+    pub outcome: Option<String>,
+    pub token_id: Option<String>,
+    pub best_bid: Option<String>,
+    pub best_ask: Option<String>,
+    pub top_bid_size: Option<String>,
+    pub top_ask_size: Option<String>,
+    pub book_timestamp: Option<String>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
@@ -568,7 +783,9 @@ pub struct BinaryComplementCheck {
 #[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct PriceHistoryOutput {
     pub token_id: String,
+    pub upstream_point_count: usize,
     pub point_count: usize,
+    pub truncated: bool,
     pub points: Vec<PricePoint>,
 }
 
@@ -638,7 +855,7 @@ pub struct WalletPosition {
 #[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct WalletValueOutput {
     pub wallet: String,
-    pub value_usdc: String,
+    pub value_pusd: String,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
@@ -677,7 +894,7 @@ pub struct WalletActivity {
     pub condition_id: Option<String>,
     pub token_id: Option<String>,
     pub size: String,
-    pub usdc_size: String,
+    pub pusd_size: String,
     pub price: Option<String>,
     pub side: Option<String>,
     pub title: Option<String>,
@@ -712,6 +929,8 @@ pub struct WatchInfo {
     pub rest_seed_count: u64,
     pub websocket_update_count: u64,
     pub price_change_count: u64,
+    pub retained_event_count: usize,
+    pub dropped_event_count: u64,
     pub reconnect_count: u64,
     pub error_count: u64,
     pub last_error: Option<String>,
@@ -727,10 +946,62 @@ pub struct RealtimeStatusOutput {
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct UserWatchInfo {
+    pub watch_id: String,
+    pub condition_ids: Vec<String>,
+    pub started_at_ms: u64,
+    pub last_event_at_ms: Option<u64>,
+    pub connection_state: String,
+    pub event_count: u64,
+    pub retained_event_count: usize,
+    pub dropped_event_count: u64,
+    pub error_count: u64,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct UserRealtimeStatusOutput {
+    pub active_watch_count: usize,
+    pub watches: Vec<UserWatchInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct UserRealtimeEventsOutput {
+    pub watch: UserWatchInfo,
+    pub after_sequence: u64,
+    pub next_sequence: u64,
+    pub oldest_available_sequence: Option<u64>,
+    pub truncated_before: bool,
+    pub events: Vec<UserRealtimeEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct UserRealtimeEvent {
+    pub sequence: u64,
+    pub event_type: String,
+    pub timestamp: Option<i64>,
+    pub condition_id: String,
+    pub token_id: String,
+    pub id: String,
+    pub side: String,
+    pub price: String,
+    pub size: Option<String>,
+    pub matched_size: Option<String>,
+    pub status: Option<String>,
+    pub outcome: Option<String>,
+    pub transaction_hash: Option<String>,
+    pub trader_side: Option<String>,
+    pub taker_order_id: Option<String>,
+    pub associated_trade_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct RealtimeEventsOutput {
     pub watch_id: String,
     pub count: usize,
     pub latest_sequence: u64,
+    pub oldest_available_sequence: Option<u64>,
+    pub truncated_before: bool,
     pub events: Vec<RealtimeEvent>,
 }
 
@@ -845,8 +1116,8 @@ pub struct TradingStatusOutput {
     pub signer_address: Option<String>,
     pub signature_type: String,
     pub funder_address: Option<String>,
-    pub automatic_heartbeats_enabled: bool,
-    pub max_order_notional_usdc: String,
+    pub cancel_on_disconnect_enabled: bool,
+    pub max_order_notional_pusd: String,
     pub safety_model: String,
 }
 
@@ -875,7 +1146,7 @@ pub struct OrderPreviewOutput {
     pub amount_unit: String,
     pub price: Option<String>,
     pub order_type: String,
-    pub maximum_notional_usdc: String,
+    pub maximum_notional_pusd: String,
     pub live_validation_performed: bool,
     pub current_tick_size: Option<String>,
     pub current_min_order_size: Option<String>,

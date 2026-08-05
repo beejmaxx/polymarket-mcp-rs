@@ -14,9 +14,9 @@ The MCP Bundle contains all five targets. Native Linux builds currently require 
 
 ## MCP clients
 
-The server uses stdio and keeps stdout exclusively for MCP frames. It is suitable for clients that can launch a local stdio server, including Codex, Claude Code/Desktop, VS Code, Cursor, and other generic MCP hosts.
+The server supports local stdio and stateless Streamable HTTP. Stdio keeps stdout exclusively for MCP frames and works with Codex, Claude Code/Desktop, VS Code, Cursor, and other generic MCP hosts. HTTP uses the official Rust SDK transport at `/mcp` and is intended for the credential-free `chatgpt` or `core` profile.
 
-Automated tests exercise initialization, capability negotiation, `tools/list`, structured `tools/call`, typed errors, profile enforcement, shutdown, and a real compiled child process through the official Rust MCP SDK. The upstream MCP conformance runner currently tests servers by HTTP URL; it cannot directly drive this stdio-only deployment. Adding an HTTP transport solely for a CI badge is intentionally out of scope.
+Automated tests exercise initialization, capability negotiation, `tools/list`, `resources/list`, UI resource reads, structured `tools/call`, typed errors, profile enforcement, shutdown, a real compiled child process, and a real HTTP client through the official Rust MCP SDK. The inline card uses the portable MCP Apps resource URI and bridge; all tools remain fully usable without UI.
 
 ## Polymarket
 

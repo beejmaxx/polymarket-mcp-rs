@@ -1,0 +1,23 @@
+app = "replace-with-your-polymarket-mcp-name"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  POLYMARKET_CACHE_TTL_MS = "2000"
+  POLYMARKET_HTTP_RATE_LIMIT_PER_MINUTE = "120"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[http_service.checks]]
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "15s"
+    method = "GET"
+    path = "/healthz"

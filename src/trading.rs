@@ -36,7 +36,9 @@ use crate::{
         AccountTrade, AccountTradesOutput, BalanceAllowanceOutput, BatchPlacedOrdersOutput,
         CancelFailure, CancelOrdersOutput, ContractAllowance, OpenOrder, OpenOrdersOutput,
         OrderApprovalStatusOutput, OrderPreviewOutput, PlacedOrderOutput, TradingStatusOutput,
+        UserRealtimeEventsOutput, UserRealtimeStatusOutput, UserWatchInfo,
     },
+    user_realtime::UserRealtimeService,
 };
 
 type AuthClient = ClobClient<Authenticated<Normal>>;
@@ -50,6 +52,7 @@ pub struct TradingService {
     max_notional: Decimal,
     approvals: Arc<Mutex<HashMap<String, OrderPlan>>>,
     context: Arc<Mutex<Option<AuthContext>>>,
+    user_realtime: UserRealtimeService,
     next_id: Arc<AtomicU64>,
     audit_path: PathBuf,
 }
@@ -94,6 +97,23 @@ impl fmt::Debug for TradingService {
 }
 
 impl TradingService {
+    /// Construct a credential-blind trading service for public HTTP deployments.
+    /// Environment keys and enablement flags are intentionally ignored.
+    pub fn disabled(audit_path: PathBuf) -> Self {
+        Self {
+            enabled: false,
+            signer: None,
+            signature_type: SignatureType::Eoa,
+            funder: None,
+            max_notional: Decimal::from(100),
+            approvals: Arc::new(Mutex::new(HashMap::new())),
+            context: Arc::new(Mutex::new(None)),
+            user_realtime: UserRealtimeService::new(),
+            next_id: Arc::new(AtomicU64::new(1)),
+            audit_path,
+        }
+    }
+
     pub fn from_environment(audit_path: PathBuf) -> Result<Self, AppError> {
         let enabled = std::env::var("POLYMARKET_ENABLE_TRADING")
             .is_ok_and(|value| value.eq_ignore_ascii_case("true"));
@@ -131,15 +151,16 @@ impl TradingService {
             }
             _ => {}
         }
-        let max_notional = std::env::var("POLYMARKET_MAX_ORDER_USDC")
+        let max_notional = std::env::var("POLYMARKET_MAX_ORDER_PUSD")
+            .or_else(|_| std::env::var("POLYMARKET_MAX_ORDER_USDC"))
             .unwrap_or_else(|_| "100".to_owned())
             .parse::<Decimal>()
             .map_err(|error| {
-                AppError::InvalidInput(format!("invalid POLYMARKET_MAX_ORDER_USDC: {error}"))
+                AppError::InvalidInput(format!("invalid POLYMARKET_MAX_ORDER_PUSD: {error}"))
             })?;
         if max_notional <= Decimal::ZERO {
             return Err(AppError::InvalidInput(
-                "POLYMARKET_MAX_ORDER_USDC must be greater than zero".to_owned(),
+                "POLYMARKET_MAX_ORDER_PUSD must be greater than zero".to_owned(),
             ));
         }
         Ok(Self {
@@ -150,6 +171,7 @@ impl TradingService {
             max_notional,
             approvals: Arc::new(Mutex::new(HashMap::new())),
             context: Arc::new(Mutex::new(None)),
+            user_realtime: UserRealtimeService::new(),
             next_id: Arc::new(AtomicU64::new(1)),
             audit_path,
         })
@@ -163,9 +185,9 @@ impl TradingService {
             signer_address: self.signer.as_ref().map(|signer| signer.address().to_string()),
             signature_type: self.signature_type.to_string(),
             funder_address: self.funder.map(|address| address.to_string()),
-            automatic_heartbeats_enabled: true,
-            max_order_notional_usdc: self.max_notional.to_string(),
-            safety_model: "Trading is off unless POLYMARKET_ENABLE_TRADING=true. Placement requires a single-use five-minute preview approval and confirm=true; every order is capped by POLYMARKET_MAX_ORDER_USDC. Cancellation requires separate explicit confirmation.".to_owned(),
+            cancel_on_disconnect_enabled: false,
+            max_order_notional_pusd: self.max_notional.to_string(),
+            safety_model: "Trading is off unless POLYMARKET_ENABLE_TRADING=true. Placement requires a single-use five-minute preview approval and confirm=true; every order is capped by POLYMARKET_MAX_ORDER_PUSD. Account reads do not arm cancel-on-disconnect. Cancellation requires separate explicit confirmation.".to_owned(),
         }
     }
 
@@ -235,7 +257,7 @@ impl TradingService {
                         ));
                     }
                 };
-                let unit = if side == Side::Buy { "usdc" } else { "shares" };
+                let unit = if side == Side::Buy { "pusd" } else { "shares" };
                 (order_type, None, unit, amount, vec!["Market execution depends on book changes, latency, balance, allowances, and fees; preview is a policy check, not a guaranteed fill.".to_owned()])
             }
             _ => {
@@ -246,7 +268,7 @@ impl TradingService {
         };
         if notional > self.max_notional {
             return Err(AppError::InvalidInput(format!(
-                "maximum notional {notional} exceeds configured limit {} USDC",
+                "maximum notional {notional} exceeds configured limit {} pUSD",
                 self.max_notional
             )));
         }
@@ -300,7 +322,7 @@ impl TradingService {
             amount_unit: amount_unit.to_owned(),
             price: price.map(|value| value.to_string()),
             order_type: order_type.to_string(),
-            maximum_notional_usdc: notional.to_string(),
+            maximum_notional_pusd: notional.to_string(),
             live_validation_performed: market_rules.is_some(),
             current_tick_size: market_rules.map(|(tick, _)| tick.to_string()),
             current_min_order_size: market_rules.map(|(_, minimum)| minimum.to_string()),
@@ -518,7 +540,7 @@ impl TradingService {
         });
         if batch_notional > self.max_notional {
             return Err(AppError::InvalidInput(format!(
-                "batch maximum notional {batch_notional} exceeds configured limit {} USDC",
+                "batch maximum notional {batch_notional} exceeds configured limit {} pUSD",
                 self.max_notional
             )));
         }
@@ -659,6 +681,45 @@ impl TradingService {
             next_cursor: (!page.next_cursor.is_empty()).then_some(page.next_cursor),
             trades: page.data.into_iter().map(account_trade).collect(),
         })
+    }
+
+    pub async fn watch_user_events(
+        &self,
+        condition_ids: Vec<B256>,
+    ) -> Result<UserWatchInfo, AppError> {
+        self.require_signer()?;
+        let (credentials, address) = {
+            let mut context = self.context.lock().await;
+            self.ensure_authenticated(&mut context).await?;
+            let client = &context.as_ref().unwrap().client;
+            (client.credentials().clone(), client.address())
+        };
+        self.user_realtime
+            .watch(credentials, address, condition_ids)
+            .await
+    }
+
+    pub async fn user_events(
+        &self,
+        watch_id: &str,
+        after_sequence: u64,
+        limit: usize,
+    ) -> Result<UserRealtimeEventsOutput, AppError> {
+        self.user_realtime
+            .events(watch_id, after_sequence, limit)
+            .await
+    }
+
+    pub async fn user_realtime_status(&self) -> UserRealtimeStatusOutput {
+        self.user_realtime.status().await
+    }
+
+    pub async fn stop_user_watch(&self, watch_id: &str) -> crate::types::StopWatchOutput {
+        self.user_realtime.stop(watch_id).await
+    }
+
+    pub async fn stop_user_watches(&self) -> usize {
+        self.user_realtime.stop_all().await
     }
 
     pub async fn cancel_order(

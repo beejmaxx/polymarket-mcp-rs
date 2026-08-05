@@ -36,6 +36,8 @@ use crate::{
     },
 };
 
+const MAX_ACTIVE_WATCHES: usize = 16;
+
 pub const CLOB_WS_ENDPOINT: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 
 #[derive(Clone, Debug)]
@@ -80,6 +82,7 @@ struct WatchState {
     rest_seed_count: u64,
     websocket_update_count: u64,
     price_change_count: u64,
+    dropped_event_count: u64,
     reconnect_count: u64,
     error_count: u64,
     last_error: Option<String>,
@@ -110,11 +113,25 @@ impl RealtimeService {
         token_ids: Vec<U256>,
         initial_books: Vec<OrderBookSummaryResponse>,
     ) -> Result<WatchInfo, AppError> {
-        let watch_id = format!("watch-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
         let token_id_strings = token_ids
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>();
+        {
+            let states = self.watches.read().await;
+            if let Some((watch_id, state)) = states
+                .iter()
+                .find(|(_, state)| state.token_ids == token_id_strings)
+            {
+                return Ok(watch_info(watch_id, state));
+            }
+            if states.len() >= MAX_ACTIVE_WATCHES {
+                return Err(AppError::InvalidInput(format!(
+                    "at most {MAX_ACTIVE_WATCHES} concurrent watches are allowed; stop an existing watch first"
+                )));
+            }
+        }
+        let watch_id = format!("watch-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
         let (cancel, cancel_rx) = watch::channel(false);
         let seeded_at = now_ms();
         let books = initial_books
@@ -134,6 +151,7 @@ impl RealtimeService {
             rest_seed_count: seed_count,
             websocket_update_count: 0,
             price_change_count: 0,
+            dropped_event_count: 0,
             reconnect_count: 0,
             error_count: 0,
             last_error: None,
@@ -143,7 +161,21 @@ impl RealtimeService {
             cancel,
         };
         let info = watch_info(&watch_id, &state);
-        self.watches.write().await.insert(watch_id.clone(), state);
+        {
+            let mut states = self.watches.write().await;
+            if let Some((existing_id, existing)) = states
+                .iter()
+                .find(|(_, existing)| existing.token_ids == token_id_strings)
+            {
+                return Ok(watch_info(existing_id, existing));
+            }
+            if states.len() >= MAX_ACTIVE_WATCHES {
+                return Err(AppError::InvalidInput(format!(
+                    "at most {MAX_ACTIVE_WATCHES} concurrent watches are allowed; stop an existing watch first"
+                )));
+            }
+            states.insert(watch_id.clone(), state);
+        }
 
         let task = WatchTask {
             watch_id,
@@ -216,10 +248,14 @@ impl RealtimeService {
             .take(limit)
             .cloned()
             .collect::<Vec<_>>();
+        let oldest_available_sequence = state.recent_events.front().map(|event| event.sequence);
         Ok(RealtimeEventsOutput {
             watch_id: watch_id.to_owned(),
             count: events.len(),
             latest_sequence: state.next_event_sequence.saturating_sub(1),
+            oldest_available_sequence,
+            truncated_before: oldest_available_sequence
+                .is_some_and(|oldest| after_sequence.saturating_add(1) < oldest),
             events,
         })
     }
@@ -471,6 +507,7 @@ impl WatchTask {
             state.next_event_sequence += 1;
             if state.recent_events.len() == 1_024 {
                 state.recent_events.pop_front();
+                state.dropped_event_count += 1;
             }
             state.recent_events.push_back(event.clone());
         };
@@ -670,6 +707,8 @@ fn watch_info(watch_id: &str, state: &WatchState) -> WatchInfo {
         rest_seed_count: state.rest_seed_count,
         websocket_update_count: state.websocket_update_count,
         price_change_count: state.price_change_count,
+        retained_event_count: state.recent_events.len(),
+        dropped_event_count: state.dropped_event_count,
         reconnect_count: state.reconnect_count,
         error_count: state.error_count,
         last_error: state.last_error.clone(),

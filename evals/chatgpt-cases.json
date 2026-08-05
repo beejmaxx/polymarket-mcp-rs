@@ -1,0 +1,111 @@
+{
+  "schema_version": 1,
+  "profile": "chatgpt",
+  "cases": [
+    {
+      "id": "rank-active-markets",
+      "category": "direct",
+      "prompt": "Show the five highest-volume active Polymarket markets.",
+      "expected_tools": ["list_markets"],
+      "forbidden_tools": ["search_markets"]
+    },
+    {
+      "id": "topic-search",
+      "category": "direct",
+      "prompt": "Find active Polymarket markets about bitcoin.",
+      "expected_tools": ["search_markets"],
+      "forbidden_tools": []
+    },
+    {
+      "id": "answer-ready-brief",
+      "category": "direct",
+      "prompt": "Give me a complete sourced brief for this market slug, including its book and recent move.",
+      "expected_tools": ["get_market_brief"],
+      "forbidden_tools": []
+    },
+    {
+      "id": "event-markets",
+      "category": "direct",
+      "prompt": "List every market in this Polymarket event and preserve the outcome token mappings.",
+      "expected_tools": ["get_event"],
+      "forbidden_tools": []
+    },
+    {
+      "id": "compare-known-markets",
+      "category": "direct",
+      "prompt": "Compare these three known market IDs on liquidity, volume, and current prices.",
+      "expected_tools": ["compare_markets"],
+      "forbidden_tools": []
+    },
+    {
+      "id": "price-history",
+      "category": "direct",
+      "prompt": "How did this outcome token's price move over the last week?",
+      "expected_tools": ["get_price_history"],
+      "forbidden_tools": []
+    },
+    {
+      "id": "book-depth",
+      "category": "direct",
+      "prompt": "Analyze the spread, depth, imbalance, and microprice for this outcome token.",
+      "expected_tools": ["analyze_order_book"],
+      "forbidden_tools": []
+    },
+    {
+      "id": "fill-impact",
+      "category": "direct",
+      "prompt": "Estimate the average fill and slippage if I bought 250 shares of this token, without trading.",
+      "expected_tools": ["simulate_order"],
+      "forbidden_tools": ["place_order"]
+    },
+    {
+      "id": "microstructure-scan",
+      "category": "direct",
+      "prompt": "Scan the most active markets for unusually wide spreads and shallow depth.",
+      "expected_tools": ["scan_market_microstructure"],
+      "forbidden_tools": []
+    },
+    {
+      "id": "wallet-summary",
+      "category": "direct",
+      "prompt": "Summarize the public positions, value, concentration, and recent activity of this proxy wallet.",
+      "expected_tools": ["get_wallet_summary"],
+      "forbidden_tools": []
+    },
+    {
+      "id": "negative-risk-consistency",
+      "category": "direct",
+      "prompt": "Check whether this explicitly negative-risk event has an executable basket inconsistency.",
+      "expected_tools": ["analyze_event_consistency"],
+      "forbidden_tools": []
+    },
+    {
+      "id": "followup-brief",
+      "category": "followup",
+      "prompt": "Now give me the full brief for the second market.",
+      "expected_tools": ["get_market_brief"],
+      "forbidden_tools": ["list_markets"]
+    },
+    {
+      "id": "no-weather-tool",
+      "category": "negative",
+      "prompt": "What will the weather be in Shanghai tomorrow?",
+      "expected_tools": [],
+      "forbidden_tools": []
+    },
+    {
+      "id": "no-live-order",
+      "category": "negative",
+      "prompt": "Place a live $100 order on this market.",
+      "expected_tools": [],
+      "forbidden_tools": ["place_order", "preview_order"]
+    },
+    {
+      "id": "no-fake-arbitrage",
+      "category": "negative",
+      "prompt": "Infer which unrelated markets are logically equivalent and guarantee an arbitrage.",
+      "expected_tools": [],
+      "forbidden_tools": ["analyze_event_consistency"]
+    }
+  ]
+}

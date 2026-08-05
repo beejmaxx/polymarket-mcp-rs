@@ -1,37 +1,80 @@
 use std::{fmt, str::FromStr};
 
 use rmcp::{
-    ServerHandler,
+    ErrorData, RoleServer, ServerHandler,
     handler::server::{
         router::tool::ToolRouter,
         wrapper::{Json, Parameters},
     },
-    model::{Implementation, ServerCapabilities, ServerInfo},
+    model::{
+        Implementation, ListResourcesResult, MetaObject, PaginatedRequestParams,
+        ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
+        ResourceContents, ServerCapabilities, ServerInfo,
+    },
+    service::RequestContext,
     tool, tool_handler, tool_router,
 };
+
+const MARKET_CARD_URI: &str = "ui://polymarket/market-brief-v1.html";
+const MCP_APP_MIME_TYPE: &str = "text/html;profile=mcp-app";
+const MARKET_CARD_HTML: &str = include_str!("../web/market-brief.html");
+
+fn market_card_tool_meta() -> MetaObject {
+    let mut meta = MetaObject::new();
+    meta.insert(
+        "ui".to_owned(),
+        serde_json::json!({ "resourceUri": MARKET_CARD_URI }),
+    );
+    // Compatibility alias for ChatGPT clients that predate the MCP Apps field.
+    meta.insert(
+        "openai/outputTemplate".to_owned(),
+        serde_json::Value::String(MARKET_CARD_URI.to_owned()),
+    );
+    meta.insert(
+        "openai/toolInvocation/invoking".to_owned(),
+        serde_json::Value::String("Building market brief…".to_owned()),
+    );
+    meta.insert(
+        "openai/toolInvocation/invoked".to_owned(),
+        serde_json::Value::String("Market brief ready.".to_owned()),
+    );
+    meta
+}
+
+fn market_card_resource_meta() -> MetaObject {
+    let mut meta = MetaObject::new();
+    meta.insert(
+        "ui".to_owned(),
+        serde_json::json!({ "prefersBorder": true }),
+    );
+    meta
+}
 
 use crate::{
     App,
     error::AppError,
     types::{
-        AccountTradesOutput, AnalyzeOrderBookInput, ApprovalIdInput, BalanceAllowanceInput,
-        BalanceAllowanceOutput, BatchPlacedOrdersOutput, CancelAllOrdersInput,
-        CancelMarketOrdersInput, CancelOrderInput, CancelOrdersOutput, CompareMarketsInput,
-        CompareMarketsOutput, EventDetail, GetEventInput, GetLiveSnapshotInput,
-        GetMarketHoldersInput, GetMarketInput, GetOrderBookInput, GetPriceHistoryInput,
-        GetRealtimeEventsInput, ListAccountTradesInput, ListMarketsInput, ListMarketsOutput,
+        AccountTradesOutput, AnalyzeEventConsistencyInput, AnalyzeOrderBookInput, ApprovalIdInput,
+        BalanceAllowanceInput, BalanceAllowanceOutput, BatchPlacedOrdersOutput,
+        CancelAllOrdersInput, CancelMarketOrdersInput, CancelOrderInput, CancelOrdersOutput,
+        CompareMarketsInput, CompareMarketsOutput, EventConsistencyOutput, EventDetail,
+        GetEventInput, GetLiveSnapshotInput, GetMarketBriefInput, GetMarketHoldersInput,
+        GetMarketInput, GetOrderBookInput, GetPriceHistoryInput, GetRealtimeEventsInput,
+        GetUserEventsInput, ListAccountTradesInput, ListMarketsInput, ListMarketsOutput,
         ListOpenOrdersInput, ListRecordingsInput, ListRecordingsOutput, LiveSnapshotOutput,
-        MarketDetail, MarketHoldersOutput, OpenOrder, OpenOrdersOutput, OrderApprovalStatusOutput,
-        OrderBookAnalysisOutput, OrderBookDetail, OrderIdInput, OrderPreviewOutput,
-        PlaceApprovedOrderInput, PlaceBatchOrdersInput, PlacedOrderOutput, PreviewOrderInput,
-        PriceHistoryOutput, RealtimeEventsOutput, RealtimeStatusOutput, RecordingIdInput,
-        RecordingInfo, ReplayEventsInput, ReplayEventsOutput, ReplayMarketInput,
+        MarketBriefOutput, MarketDetail, MarketHoldersOutput, OpenOrder, OpenOrdersOutput,
+        OrderApprovalStatusOutput, OrderBookAnalysisOutput, OrderBookDetail, OrderIdInput,
+        OrderPreviewOutput, PlaceApprovedOrderInput, PlaceBatchOrdersInput, PlacedOrderOutput,
+        PreviewOrderInput, PriceHistoryOutput, RealtimeEventsOutput, RealtimeStatusOutput,
+        RecordingIdInput, RecordingInfo, ReplayEventsInput, ReplayEventsOutput, ReplayMarketInput,
         ReplayMarketOutput, ScanMarketMicrostructureInput, ScanMarketMicrostructureOutput,
         SearchMarketsInput, SearchMarketsOutput, ServerStatus, SimulateOrderInput,
         SimulationOutput, StartRecordingInput, StopWatchOutput, ToolError, TradingStatusOutput,
+        UserRealtimeEventsOutput, UserRealtimeStatusOutput, UserWatchIdInput, UserWatchInfo,
         WalletActivityInput, WalletActivityOutput, WalletInput, WalletPageInput,
-        WalletPositionsOutput, WalletRiskOutput, WalletTradesOutput, WalletValueOutput,
-        WatchIdInput, WatchInfo, WatchMarketsInput,
+        WalletPositionsOutput, WalletRiskOutput, WalletSummaryInput, WalletSummaryOutput,
+        WalletTradesOutput, WalletValueOutput, WatchIdInput, WatchInfo, WatchMarketsInput,
+        WatchUserEventsInput,
     },
 };
 
@@ -55,17 +98,37 @@ const TRADING_TOOLS: &[&str] = &[
     "get_balance_allowance",
     "get_order",
     "get_order_approval",
+    "get_user_events",
+    "get_user_realtime_status",
     "list_account_trades",
     "list_open_orders",
     "place_batch_orders",
     "place_order",
     "preview_order",
     "trading_status",
+    "stop_user_watch",
+    "watch_user_events",
+];
+
+const CHATGPT_TOOLS: &[&str] = &[
+    "analyze_event_consistency",
+    "analyze_order_book",
+    "compare_markets",
+    "get_event",
+    "get_market_brief",
+    "get_price_history",
+    "get_wallet_summary",
+    "list_markets",
+    "scan_market_microstructure",
+    "search_markets",
+    "simulate_order",
 ];
 
 /// Controls which capabilities are advertised and callable over MCP.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ToolProfile {
+    /// Compact, stateless, credential-free surface for hosted LLM clients.
+    Chatgpt,
     /// Public REST market and wallet data, analysis, and simulation.
     Core,
     /// Core plus realtime watching and local recording/replay.
@@ -81,6 +144,7 @@ impl ToolProfile {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Chatgpt => "chatgpt",
             Self::Core => "core",
             Self::Research => "research",
             Self::Trading => "trading",
@@ -89,7 +153,20 @@ impl ToolProfile {
     }
 
     fn configure(self, router: &mut ToolRouter<PolymarketServer>) {
+        if self == Self::Chatgpt {
+            let disabled = router
+                .list_all()
+                .into_iter()
+                .map(|tool| tool.name.to_string())
+                .filter(|name| !CHATGPT_TOOLS.contains(&name.as_str()))
+                .collect::<Vec<_>>();
+            for name in disabled {
+                router.disable_route(name);
+            }
+            return;
+        }
         let disabled = match self {
+            Self::Chatgpt => unreachable!("handled above"),
             Self::Core => RESEARCH_ONLY_TOOLS.iter().chain(TRADING_TOOLS).copied(),
             Self::Research => RESEARCH_ONLY_TOOLS[..0]
                 .iter()
@@ -121,12 +198,13 @@ impl FromStr for ToolProfile {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.trim().to_ascii_lowercase().as_str() {
+            "chatgpt" => Ok(Self::Chatgpt),
             "core" => Ok(Self::Core),
             "research" => Ok(Self::Research),
             "trading" => Ok(Self::Trading),
             "all" => Ok(Self::All),
             _ => Err(format!(
-                "unknown tool profile {value:?}; expected core, research, trading, or all"
+                "unknown tool profile {value:?}; expected chatgpt, core, research, trading, or all"
             )),
         }
     }
@@ -191,7 +269,8 @@ impl PolymarketServer {
 
     #[tool(
         name = "search_markets",
-        description = "Search active Polymarket events and return matching markets with IDs, outcome token mappings, prices, liquidity, and 24-hour volume."
+        description = "Search active Polymarket events and return matching markets with IDs, outcome token mappings, prices, liquidity, and 24-hour volume.",
+        annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn search_markets(
         &self,
@@ -206,7 +285,8 @@ impl PolymarketServer {
 
     #[tool(
         name = "get_market",
-        description = "Get one market by its Gamma market ID, including outcome token IDs and current CLOB V2 order-book summaries when the market is open."
+        description = "Get one market by its Gamma market ID, including outcome token IDs and current CLOB V2 order-book summaries when the market is open.",
+        annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn get_market(
         &self,
@@ -220,8 +300,26 @@ impl PolymarketServer {
     }
 
     #[tool(
+        name = "get_market_brief",
+        description = "Build one answer-ready, source-linked market brief from a market ID, slug, or condition ID. Combines current metadata, exact executable books, microstructure, bounded price history, sample fill impact, timestamps, and limitations. Prefer this for a complete market explanation.",
+        annotations(read_only_hint = true, open_world_hint = true),
+        meta = market_card_tool_meta()
+    )]
+    async fn get_market_brief(
+        &self,
+        Parameters(input): Parameters<GetMarketBriefInput>,
+    ) -> Result<Json<MarketBriefOutput>, Json<ToolError>> {
+        self.app
+            .get_market_brief(input)
+            .await
+            .map(Json)
+            .map_err(tool_error)
+    }
+
+    #[tool(
         name = "list_markets",
-        description = "List active open Polymarket markets, with topic, featured, liquidity, volume, sorting, and pagination filters. Prefer this over text search for scans and rankings."
+        description = "List active open Polymarket markets with stable market-level ranking and pagination plus topic, featured, liquidity, volume, and end-time filters. Prefer this over text search for scans and rankings.",
+        annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn list_markets(
         &self,
@@ -236,7 +334,8 @@ impl PolymarketServer {
 
     #[tool(
         name = "get_event",
-        description = "Get an event by Gamma event ID or slug, including metadata, tags, and all related markets with outcome-token mappings."
+        description = "Get an event by Gamma event ID or slug, including metadata, tags, and all related markets with outcome-token mappings.",
+        annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn get_event(
         &self,
@@ -250,8 +349,25 @@ impl PolymarketServer {
     }
 
     #[tool(
+        name = "analyze_event_consistency",
+        description = "Analyze an event-level mutually exclusive/exhaustive basket only when Gamma explicitly marks the event negative-risk. Sums executable Yes bids/asks, reports top-level capacity and gross edge, and refuses to infer logical relationships from text alone. Descriptive only; never places an order.",
+        annotations(read_only_hint = true, open_world_hint = true)
+    )]
+    async fn analyze_event_consistency(
+        &self,
+        Parameters(input): Parameters<AnalyzeEventConsistencyInput>,
+    ) -> Result<Json<EventConsistencyOutput>, Json<ToolError>> {
+        self.app
+            .analyze_event_consistency(input)
+            .await
+            .map(Json)
+            .map_err(tool_error)
+    }
+
+    #[tool(
         name = "get_order_book",
-        description = "Get a current CLOB V2 order book by outcome token ID, including exact bid/ask levels, spread, midpoint, tick size, and feed timestamp."
+        description = "Get a current CLOB V2 order book by outcome token ID, including exact bid/ask levels, spread, midpoint, tick size, and feed timestamp.",
+        annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn get_order_book(
         &self,
@@ -298,7 +414,8 @@ impl PolymarketServer {
 
     #[tool(
         name = "get_price_history",
-        description = "Get public historical prices for one CLOB outcome token using a preset interval or explicit Unix timestamp range."
+        description = "Get bounded public historical prices for one CLOB outcome token using a preset interval or explicit Unix timestamp range.",
+        annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn get_price_history(
         &self,
@@ -311,6 +428,7 @@ impl PolymarketServer {
                 input.start_ts,
                 input.end_ts,
                 input.fidelity,
+                input.limit,
             )
             .await
             .map(Json)
@@ -319,7 +437,8 @@ impl PolymarketServer {
 
     #[tool(
         name = "get_market_holders",
-        description = "Get the largest public holders for each outcome token in a market, identified by its 0x-prefixed condition ID."
+        description = "Get the largest public holders for each outcome token in a market, identified by its 0x-prefixed condition ID.",
+        annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn get_market_holders(
         &self,
@@ -334,7 +453,8 @@ impl PolymarketServer {
 
     #[tool(
         name = "compare_markets",
-        description = "Compare two to ten markets using the same current metadata, outcome prices, liquidity, volume, and CLOB order-book metrics."
+        description = "Compare two to ten markets using the same current metadata, outcome prices, liquidity, volume, and CLOB order-book metrics.",
+        annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn compare_markets(
         &self,
@@ -349,7 +469,8 @@ impl PolymarketServer {
 
     #[tool(
         name = "get_wallet_positions",
-        description = "Get current open positions and P/L fields for a public Polymarket proxy-wallet address. No credentials are required."
+        description = "Get current open positions and P/L fields for a public Polymarket proxy-wallet address. No credentials are required.",
+        annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn get_wallet_positions(
         &self,
@@ -364,7 +485,8 @@ impl PolymarketServer {
 
     #[tool(
         name = "get_wallet_value",
-        description = "Get the current total USDC value of open positions for a public Polymarket proxy wallet."
+        description = "Get the current total pUSD value of open positions for a public Polymarket proxy wallet.",
+        annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn get_wallet_value(
         &self,
@@ -379,7 +501,8 @@ impl PolymarketServer {
 
     #[tool(
         name = "get_wallet_trades",
-        description = "Get public executed-trade history for a Polymarket proxy wallet, with exact token IDs, prices, sizes, sides, and transaction hashes."
+        description = "Get public executed-trade history for a Polymarket proxy wallet, with exact token IDs, prices, sizes, sides, and transaction hashes.",
+        annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn get_wallet_trades(
         &self,
@@ -394,7 +517,8 @@ impl PolymarketServer {
 
     #[tool(
         name = "get_wallet_activity",
-        description = "Get public on-chain wallet activity including trades, splits, merges, redemptions, rewards, and conversions."
+        description = "Get public on-chain wallet activity including trades, splits, merges, redemptions, rewards, and conversions.",
+        annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn get_wallet_activity(
         &self,
@@ -415,7 +539,8 @@ impl PolymarketServer {
 
     #[tool(
         name = "analyze_wallet_risk",
-        description = "Compute transparent exposure, P/L, concentration, redeemability, and negative-risk summaries from a wallet's public open positions. Descriptive only; not financial advice."
+        description = "Compute transparent exposure, P/L, concentration, redeemability, and negative-risk summaries from a wallet's public open positions. Descriptive only; not financial advice.",
+        annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn analyze_wallet_risk(
         &self,
@@ -423,6 +548,22 @@ impl PolymarketServer {
     ) -> Result<Json<WalletRiskOutput>, Json<ToolError>> {
         self.app
             .analyze_wallet_risk(input.wallet)
+            .await
+            .map(Json)
+            .map_err(tool_error)
+    }
+
+    #[tool(
+        name = "get_wallet_summary",
+        description = "Build one source-linked summary for a public Polymarket proxy wallet: open positions, current value, transparent concentration and P/L metrics, recent trades, recent activity, timestamps, and limitations. No credentials are required.",
+        annotations(read_only_hint = true, open_world_hint = true)
+    )]
+    async fn get_wallet_summary(
+        &self,
+        Parameters(input): Parameters<WalletSummaryInput>,
+    ) -> Result<Json<WalletSummaryOutput>, Json<ToolError>> {
+        self.app
+            .get_wallet_summary(input)
             .await
             .map(Json)
             .map_err(tool_error)
@@ -451,7 +592,8 @@ impl PolymarketServer {
 
     #[tool(
         name = "get_live_snapshot",
-        description = "Read compact current order-book snapshots from a background watch, including upstream and local timestamps, feed age, update counts, and errors."
+        description = "Read compact current order-book snapshots from a background watch, including upstream and local timestamps, feed age, update counts, and errors.",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn get_live_snapshot(
         &self,
@@ -466,7 +608,8 @@ impl PolymarketServer {
 
     #[tool(
         name = "get_realtime_status",
-        description = "Report websocket connection state, active subscriptions, update counts, feed timestamps, and the most recent error for every watch."
+        description = "Report websocket connection state, active subscriptions, update counts, feed timestamps, and the most recent error for every watch.",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn get_realtime_status(&self) -> Json<RealtimeStatusOutput> {
         Json(self.app.get_realtime_status().await)
@@ -553,7 +696,8 @@ impl PolymarketServer {
 
     #[tool(
         name = "list_recordings",
-        description = "List local SQLite recordings with token coverage, lifecycle timestamps, snapshot counts, and any detected dropped updates."
+        description = "List local SQLite recordings with token coverage, lifecycle timestamps, snapshot counts, and any detected dropped updates.",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn list_recordings(
         &self,
@@ -568,7 +712,8 @@ impl PolymarketServer {
 
     #[tool(
         name = "replay_market",
-        description = "Replay locally recorded full-book states in deterministic upstream-timestamp order, optionally filtered by token and time range."
+        description = "Replay locally recorded full-book states in deterministic upstream-timestamp order, optionally filtered by token and time range.",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn replay_market(
         &self,
@@ -611,7 +756,8 @@ impl PolymarketServer {
 
     #[tool(
         name = "simulate_order",
-        description = "Walk the current public CLOB book to estimate fill, notional, average/worst price, and slippage for a buy or sell in outcome shares. Never places an order."
+        description = "Walk the current public CLOB book to estimate fill, notional, average/worst price, and slippage for a buy or sell in outcome shares. Never places an order.",
+        annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn simulate_order(
         &self,
@@ -626,7 +772,8 @@ impl PolymarketServer {
 
     #[tool(
         name = "trading_status",
-        description = "Report whether trading is explicitly enabled, whether a signer is configured, the signer address, the order cap, and the confirmation model. Never authenticates or trades."
+        description = "Report whether trading is explicitly enabled, whether a signer is configured, the signer address, the pUSD order cap, and the confirmation model. Never authenticates or trades.",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
     fn trading_status(&self) -> Json<TradingStatusOutput> {
         Json(self.app.trading_status())
@@ -674,7 +821,7 @@ impl PolymarketServer {
         description = "Consume a fresh single-use approval and place its exact signed order. Requires POLYMARKET_ENABLE_TRADING=true, a private key, and confirm=true.",
         annotations(
             read_only_hint = false,
-            destructive_hint = false,
+            destructive_hint = true,
             idempotent_hint = false,
             open_world_hint = true
         )
@@ -695,7 +842,7 @@ impl PolymarketServer {
         description = "Atomically submit one to ten fresh approved orders. The batch total shares the configured notional cap and requires the exact confirmation PLACE_BATCH.",
         annotations(
             read_only_hint = false,
-            destructive_hint = false,
+            destructive_hint = true,
             idempotent_hint = false,
             open_world_hint = true
         )
@@ -713,7 +860,8 @@ impl PolymarketServer {
 
     #[tool(
         name = "get_order",
-        description = "Get one authenticated account order by order ID."
+        description = "Get one authenticated account order by order ID.",
+        annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn get_order(
         &self,
@@ -728,7 +876,8 @@ impl PolymarketServer {
 
     #[tool(
         name = "list_open_orders",
-        description = "List the authenticated account's open orders, optionally filtered by outcome token ID."
+        description = "List the authenticated account's open orders, optionally filtered by outcome token ID.",
+        annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn list_open_orders(
         &self,
@@ -743,7 +892,8 @@ impl PolymarketServer {
 
     #[tool(
         name = "list_account_trades",
-        description = "List the authenticated account's CLOB trades, optionally filtered by outcome token ID."
+        description = "List the authenticated account's CLOB trades, optionally filtered by outcome token ID.",
+        annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn list_account_trades(
         &self,
@@ -751,6 +901,73 @@ impl PolymarketServer {
     ) -> Result<Json<AccountTradesOutput>, Json<ToolError>> {
         self.app
             .list_account_trades(input.token_id, input.next_cursor)
+            .await
+            .map(Json)
+            .map_err(tool_error)
+    }
+
+    #[tool(
+        name = "watch_user_events",
+        description = "Start an authenticated CLOB WebSocket watch for this account's order and trade events in one to fifty condition IDs. Requires a configured private key but not trading enablement; it never places or cancels an order.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn watch_user_events(
+        &self,
+        Parameters(input): Parameters<WatchUserEventsInput>,
+    ) -> Result<Json<UserWatchInfo>, Json<ToolError>> {
+        self.app
+            .watch_user_events(input.condition_ids)
+            .await
+            .map(Json)
+            .map_err(tool_error)
+    }
+
+    #[tool(
+        name = "get_user_events",
+        description = "Read buffered authenticated order and trade events after a watch-local sequence number.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn get_user_events(
+        &self,
+        Parameters(input): Parameters<GetUserEventsInput>,
+    ) -> Result<Json<UserRealtimeEventsOutput>, Json<ToolError>> {
+        self.app
+            .get_user_events(input.watch_id, input.after_sequence, input.limit)
+            .await
+            .map(Json)
+            .map_err(tool_error)
+    }
+
+    #[tool(
+        name = "get_user_realtime_status",
+        description = "Report authenticated user-event watches, event counts, and connection errors. This makes no network request.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn get_user_realtime_status(&self) -> Json<UserRealtimeStatusOutput> {
+        Json(self.app.get_user_realtime_status().await)
+    }
+
+    #[tool(
+        name = "stop_user_watch",
+        description = "Stop one authenticated user-event WebSocket watch. This never cancels exchange orders.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn stop_user_watch(
+        &self,
+        Parameters(input): Parameters<UserWatchIdInput>,
+    ) -> Result<Json<StopWatchOutput>, Json<ToolError>> {
+        self.app
+            .stop_user_watch(input.watch_id)
             .await
             .map(Json)
             .map_err(tool_error)
@@ -839,7 +1056,12 @@ impl PolymarketServer {
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for PolymarketServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .build(),
+        )
             .with_server_info(Implementation::new(
                 env!("CARGO_PKG_NAME"),
                 env!("CARGO_PKG_VERSION"),
@@ -850,6 +1072,38 @@ impl ServerHandler for PolymarketServer {
                     self.profile
                 ),
             )
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        Ok(ListResourcesResult::with_all_items(vec![
+            Resource::new(MARKET_CARD_URI, "polymarket-market-brief")
+                .with_title("Polymarket market brief")
+                .with_description("Portable MCP Apps card for get_market_brief results")
+                .with_mime_type(MCP_APP_MIME_TYPE),
+        ]))
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, ErrorData> {
+        if request.uri != MARKET_CARD_URI {
+            return Err(ErrorData::resource_not_found(
+                format!("unknown resource URI: {}", request.uri),
+                None,
+            ));
+        }
+        Ok(ReadResourceResult::new(vec![
+            ResourceContents::text(MARKET_CARD_HTML, MARKET_CARD_URI)
+                .with_mime_type(MCP_APP_MIME_TYPE)
+                .with_meta(market_card_resource_meta()),
+        ])
+        .into())
     }
 }
 
@@ -867,7 +1121,7 @@ mod tests {
 
     #[test]
     fn profiles_expose_intentional_tool_surfaces() {
-        let app = App::new().unwrap();
+        let app = App::new_ephemeral().unwrap();
         let names = |profile| {
             PolymarketServer::with_profile(app.clone(), profile)
                 .tools()
@@ -876,14 +1130,24 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
+        let chatgpt = names(ToolProfile::Chatgpt);
         let core = names(ToolProfile::Core);
         let research = names(ToolProfile::Research);
         let trading = names(ToolProfile::Trading);
         let all = names(ToolProfile::All);
         assert_eq!(
-            (core.len(), research.len(), trading.len(), all.len()),
-            (17, 27, 29, 39)
+            (
+                chatgpt.len(),
+                core.len(),
+                research.len(),
+                trading.len(),
+                all.len()
+            ),
+            (11, 20, 30, 36, 46)
         );
+        assert!(chatgpt.contains(&"get_market_brief".to_owned()));
+        assert!(!chatgpt.contains(&"watch_markets".to_owned()));
+        assert!(!chatgpt.contains(&"server_status".to_owned()));
         assert!(!research.contains(&"place_order".to_owned()));
         assert!(!research.contains(&"trading_status".to_owned()));
         assert!(trading.contains(&"place_order".to_owned()));
@@ -901,7 +1165,7 @@ mod tests {
 
     #[test]
     fn advertises_project_identity() {
-        let server = PolymarketServer::new(App::new().unwrap());
+        let server = PolymarketServer::new(App::new_ephemeral().unwrap());
         let info = server.get_info();
         assert_eq!(info.server_info.name, "polymarket-mcp-rs");
         assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));

@@ -13,8 +13,10 @@ Include the affected version, reproduction steps, impact, and any suggested miti
 - Trading is disabled unless `POLYMARKET_ENABLE_TRADING=true`.
 - Private keys are loaded from process environment and must never be committed or logged.
 - Order placement and cancellation require explicit confirmation fields.
-- The server is designed for local stdio use. Do not expose it as a remote unauthenticated service.
-- Use a dedicated low-value wallet and a conservative `POLYMARKET_MAX_ORDER_USDC` while evaluating trading features.
+- Local stdio is the only supported surface for stateful research or trading profiles.
+- Public Streamable HTTP accepts only `chatgpt` or `core`, uses an in-memory application instance, and ignores trading credentials even if they are present in the environment.
+- A public deployment is intentionally unauthenticated because it exposes only public read-only data. Use the documented host allowlist, TLS termination, limits, and timeouts; add real authentication before introducing private data or actions.
+- Use a dedicated low-value wallet and a conservative `POLYMARKET_MAX_ORDER_PUSD` while evaluating trading features.
 
 Market data is public, but locally recorded books and wallet activity may still be operationally sensitive. Protect the SQLite database accordingly.
 

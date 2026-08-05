@@ -1,13 +1,21 @@
-use std::{collections::HashMap, path::PathBuf, str::FromStr};
+use std::{
+    collections::HashMap,
+    fs,
+    path::PathBuf,
+    str::FromStr,
+    sync::Arc,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
 use futures::StreamExt as _;
 use polymarket_client_sdk_v2::{
     clob::types::{Interval, TimeRange, response::OrderBookSummaryResponse},
     data::types::response::{Activity, Position, Trade},
-    gamma::types::request::EventsRequest,
+    gamma::types::request::{EventsRequest, MarketsRequest},
     gamma::types::response::{Event, Market},
-    types::{Address, B256, Decimal, U256},
+    types::{Address, B256, DateTime, Decimal, U256, Utc},
 };
+use tokio::sync::RwLock;
 
 use crate::{
     error::AppError,
@@ -16,25 +24,29 @@ use crate::{
     recorder::RecorderService,
     trading::{PreviewParameters, TradingService},
     types::{
-        AccountTradesOutput, AnalyzeOrderBookInput, BalanceAllowanceOutput,
-        BatchPlacedOrdersOutput, BinaryComplementCheck, CancelOrdersOutput, CompareMarketsOutput,
-        EventDetail, HolderDetail, ListMarketsInput, ListMarketsOutput, ListRecordingsOutput,
-        LiveSnapshotOutput, MarketDetail, MarketHoldersOutput, MarketMicrostructureSummary,
-        MarketSummary, OpenOrder, OpenOrdersOutput, OrderApprovalStatusOutput,
-        OrderBookAnalysisOutput, OrderBookDetail, OrderBookSnapshot, OrderPreviewOutput,
-        OutcomeDetail, OutcomeHolders, OutcomeMicrostructureSummary, OutcomeQuote,
-        PlacedOrderOutput, PreviewOrderInput, PriceHistoryOutput, PriceLevel, PricePoint,
-        RealtimeEventsOutput, RealtimeStatusOutput, RecordingInfo, ReplayEventsOutput,
-        ReplayMarketOutput, ScanMarketMicrostructureInput, ScanMarketMicrostructureOutput,
-        SearchMarketsOutput, ServerStatus, SimulationOutput, StopWatchOutput, TagSummary,
-        TradingStatusOutput, WalletActivity, WalletActivityOutput, WalletPosition,
-        WalletPositionsOutput, WalletRiskOutput, WalletTrade, WalletTradesOutput,
+        AccountTradesOutput, AnalyzeEventConsistencyInput, AnalyzeOrderBookInput,
+        BalanceAllowanceOutput, BatchPlacedOrdersOutput, BinaryComplementCheck, CancelOrdersOutput,
+        CompareMarketsOutput, EventConsistencyLeg, EventConsistencyOutput, EventDetail,
+        GetMarketBriefInput, HolderDetail, ListMarketsInput, ListMarketsOutput,
+        ListRecordingsOutput, LiveSnapshotOutput, MarketBriefOutcome, MarketBriefOutput,
+        MarketDetail, MarketHoldersOutput, MarketMicrostructureSummary, MarketSummary, OpenOrder,
+        OpenOrdersOutput, OrderApprovalStatusOutput, OrderBookAnalysisOutput, OrderBookDetail,
+        OrderBookSnapshot, OrderPreviewOutput, OutcomeDetail, OutcomeHolders,
+        OutcomeMicrostructureSummary, OutcomeQuote, PlacedOrderOutput, PreviewOrderInput,
+        PriceHistoryOutput, PriceHistorySummary, PriceLevel, PricePoint, RealtimeEventsOutput,
+        RealtimeStatusOutput, RecordingInfo, ReplayEventsOutput, ReplayMarketOutput,
+        ScanMarketMicrostructureInput, ScanMarketMicrostructureOutput, SearchMarketsOutput,
+        ServerStatus, SimulationOutput, SourceReference, StopWatchOutput, TagSummary,
+        TradingStatusOutput, UserRealtimeEventsOutput, UserRealtimeStatusOutput, UserWatchInfo,
+        WalletActivity, WalletActivityOutput, WalletPosition, WalletPositionsOutput,
+        WalletRiskOutput, WalletSummaryInput, WalletSummaryOutput, WalletTrade, WalletTradesOutput,
         WalletValueOutput, WatchInfo,
     },
 };
 
 const DEFAULT_SEARCH_LIMIT: u8 = 10;
 const MAX_SEARCH_LIMIT: u8 = 25;
+type BriefCache = Arc<RwLock<HashMap<String, (Instant, MarketBriefOutput)>>>;
 
 #[derive(Clone, Debug)]
 pub struct App {
@@ -42,23 +54,55 @@ pub struct App {
     realtime: RealtimeService,
     recorder: RecorderService,
     trading: TradingService,
+    brief_cache: BriefCache,
+    brief_cache_ttl: Duration,
 }
 
 impl App {
     pub fn new() -> Result<Self, AppError> {
         let database_path = std::env::var_os("POLYMARKET_MCP_DB")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("polymarket-mcp.sqlite3"));
+            .unwrap_or_else(default_database_path);
         Self::new_with_database(database_path)
     }
 
+    /// Build an app for catalog inspection without creating a persistent database file.
+    pub fn new_ephemeral() -> Result<Self, AppError> {
+        Self::new_with_database(PathBuf::from(":memory:"))
+    }
+
+    /// Build the credential-blind, non-persistent core used by public HTTP.
+    pub fn new_public() -> Result<Self, AppError> {
+        let database_path = PathBuf::from(":memory:");
+        Ok(Self {
+            client: PolymarketClient::new()?,
+            realtime: RealtimeService::new()?,
+            recorder: RecorderService::new(database_path.clone())?,
+            trading: TradingService::disabled(database_path),
+            brief_cache: Arc::new(RwLock::new(HashMap::new())),
+            brief_cache_ttl: cache_ttl_from_environment(2_000)?,
+        })
+    }
+
     pub fn new_with_database(database_path: PathBuf) -> Result<Self, AppError> {
+        if database_path.as_os_str() != ":memory:"
+            && let Some(parent) = database_path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent).map_err(|error| AppError::Upstream {
+                service: "SQLite recorder",
+                message: format!("could not create {}: {error}", parent.display()),
+            })?;
+        }
         let trading_database_path = database_path.clone();
         Ok(Self {
             client: PolymarketClient::new()?,
             realtime: RealtimeService::new()?,
             recorder: RecorderService::new(database_path)?,
             trading: TradingService::from_environment(trading_database_path)?,
+            brief_cache: Arc::new(RwLock::new(HashMap::new())),
+            brief_cache_ttl: cache_ttl_from_environment(0)?,
         })
     }
 
@@ -86,7 +130,8 @@ impl App {
     pub async fn shutdown(&self) -> Result<(usize, usize), AppError> {
         // Flush recordings while their source watches still exist, then cancel watches.
         let recording_result = self.recorder.stop_all().await;
-        let stopped_watches = self.realtime.stop_all().await;
+        let stopped_watches =
+            self.realtime.stop_all().await + self.trading.stop_user_watches().await;
         recording_result.map(|stopped_recordings| (stopped_recordings, stopped_watches))
     }
 
@@ -131,6 +176,7 @@ impl App {
         markets.truncate(usize::from(limit));
 
         Ok(SearchMarketsOutput {
+            as_of_ms: now_ms(),
             query,
             count: markets.len(),
             markets,
@@ -173,6 +219,316 @@ impl App {
         self.enrich_market(market).await
     }
 
+    pub async fn get_market_brief(
+        &self,
+        input: GetMarketBriefInput,
+    ) -> Result<MarketBriefOutput, AppError> {
+        let cache_key = format!("{input:?}");
+        if !self.brief_cache_ttl.is_zero()
+            && let Some((inserted, brief)) = self.brief_cache.read().await.get(&cache_key)
+            && inserted.elapsed() <= self.brief_cache_ttl
+        {
+            return Ok(brief.clone());
+        }
+        let sample_shares = input
+            .sample_shares
+            .as_deref()
+            .map(|value| parse_decimal("sample_shares", value))
+            .transpose()?
+            .unwrap_or_else(|| Decimal::from(100));
+        if sample_shares <= Decimal::ZERO {
+            return Err(AppError::InvalidInput(
+                "sample_shares must be greater than zero".to_owned(),
+            ));
+        }
+        let history_interval = input.history_interval.unwrap_or_else(|| "1d".to_owned());
+        parse_interval(&history_interval)?;
+        let history_limit = input.history_limit.unwrap_or(50).clamp(2, 250);
+        let market = self
+            .get_market_by_identifier(input.market_id, input.slug, input.condition_id)
+            .await?;
+        let mut outcome_research = Vec::with_capacity(market.outcomes.len());
+        for outcome in &market.outcomes {
+            let mut errors = Vec::new();
+            let (analysis, history) = if let Some(token_id) = &outcome.token_id {
+                let analysis = match self
+                    .analyze_order_book(AnalyzeOrderBookInput {
+                        token_id: token_id.clone(),
+                        depth: Some(50),
+                        price_band: Some("0.02".to_owned()),
+                        sample_shares: Some(sample_shares.to_string()),
+                    })
+                    .await
+                {
+                    Ok(value) => Some(value),
+                    Err(error) => {
+                        errors.push(format!("order-book analysis unavailable: {error}"));
+                        None
+                    }
+                };
+                let history = match self
+                    .get_price_history(
+                        token_id.clone(),
+                        Some(history_interval.clone()),
+                        None,
+                        None,
+                        None,
+                        Some(history_limit),
+                    )
+                    .await
+                {
+                    Ok(value) => Some(price_history_summary(&history_interval, &value.points)),
+                    Err(error) => {
+                        errors.push(format!("price history unavailable: {error}"));
+                        None
+                    }
+                };
+                (analysis, history)
+            } else {
+                errors.push("outcome has no CLOB token ID".to_owned());
+                (None, None)
+            };
+            outcome_research.push(MarketBriefOutcome {
+                outcome: outcome.name.clone(),
+                token_id: outcome.token_id.clone(),
+                gamma_price: outcome.gamma_price.clone(),
+                analysis,
+                history,
+                errors,
+            });
+        }
+        let as_of_ms = now_ms();
+        let mut sources = vec![SourceReference {
+            name: "Polymarket Gamma API".to_owned(),
+            url: market.gamma_url.clone(),
+            scope: "market metadata, outcome mappings, liquidity, and volume".to_owned(),
+            retrieved_at_ms: as_of_ms,
+        }];
+        sources.push(SourceReference {
+            name: "Polymarket CLOB V2".to_owned(),
+            url: CLOB_V2_ENDPOINT.to_owned(),
+            scope: "current executable books and public price history".to_owned(),
+            retrieved_at_ms: as_of_ms,
+        });
+        if let Some(url) = &market.polymarket_url {
+            sources.push(SourceReference {
+                name: "Polymarket market page".to_owned(),
+                url: url.clone(),
+                scope: "human-readable market, rules, and resolution context".to_owned(),
+                retrieved_at_ms: as_of_ms,
+            });
+        }
+        let brief = MarketBriefOutput {
+            as_of_ms,
+            market,
+            outcome_research,
+            sources,
+            limitations: vec![
+                "Prices and books can change immediately after the reported timestamps.".to_owned(),
+                "Execution estimates walk displayed L2 depth and exclude fees, queue position, latency, and future book changes.".to_owned(),
+                "Probabilities are market prices, not factual forecasts or trading recommendations.".to_owned(),
+            ],
+        };
+        if !self.brief_cache_ttl.is_zero() {
+            let mut cache = self.brief_cache.write().await;
+            if cache.len() >= 256 {
+                cache.retain(|_, (inserted, _)| inserted.elapsed() <= self.brief_cache_ttl);
+                if cache.len() >= 256
+                    && let Some(oldest) = cache
+                        .iter()
+                        .min_by_key(|(_, (inserted, _))| *inserted)
+                        .map(|(key, _)| key.clone())
+                {
+                    cache.remove(&oldest);
+                }
+            }
+            cache.insert(cache_key, (Instant::now(), brief.clone()));
+        }
+        Ok(brief)
+    }
+
+    pub async fn get_wallet_summary(
+        &self,
+        input: WalletSummaryInput,
+    ) -> Result<WalletSummaryOutput, AppError> {
+        let wallet = validate_nonempty("wallet", input.wallet)?;
+        let recent_limit = input.recent_limit.unwrap_or(20).clamp(1, 100);
+        let (positions, value, risk, recent_trades, recent_activity) = tokio::try_join!(
+            self.get_wallet_positions(wallet.clone(), Some(500), None),
+            self.get_wallet_value(wallet.clone()),
+            self.analyze_wallet_risk(wallet.clone()),
+            self.get_wallet_trades(wallet.clone(), Some(recent_limit), None),
+            self.get_wallet_activity(wallet.clone(), Some(recent_limit), None, None, None),
+        )?;
+        let as_of_ms = now_ms();
+        Ok(WalletSummaryOutput {
+            as_of_ms,
+            wallet: wallet.clone(),
+            positions,
+            value,
+            risk,
+            recent_trades,
+            recent_activity,
+            sources: [
+                ("positions", "current public positions and position P/L"),
+                ("value", "reported aggregate position value"),
+                ("trades", "recent public trades"),
+                ("activity", "recent public on-chain activity"),
+            ]
+            .into_iter()
+            .map(|(endpoint, scope)| SourceReference {
+                name: format!("Polymarket Data API /{endpoint}"),
+                url: format!("{DATA_ENDPOINT}/{endpoint}?user={wallet}"),
+                scope: scope.to_owned(),
+                retrieved_at_ms: as_of_ms,
+            })
+            .collect(),
+            limitations: vec![
+                "Wallet data is public proxy-wallet data and may not identify a person.".to_owned(),
+                "Risk metrics describe current reported positions and are not financial advice."
+                    .to_owned(),
+            ],
+        })
+    }
+
+    pub async fn analyze_event_consistency(
+        &self,
+        input: AnalyzeEventConsistencyInput,
+    ) -> Result<EventConsistencyOutput, AppError> {
+        if input.event_id.is_some() == input.slug.is_some() {
+            return Err(AppError::InvalidInput(
+                "provide exactly one of event_id or slug".to_owned(),
+            ));
+        }
+        let event = if let Some(event_id) = input.event_id {
+            self.client
+                .event_by_id(&validate_nonempty("event_id", event_id)?)
+                .await?
+        } else {
+            self.client
+                .event_by_slug(&validate_nonempty("slug", input.slug.unwrap())?)
+                .await?
+        };
+        let explicit_negative_risk =
+            event.neg_risk == Some(true) || event.enable_neg_risk == Some(true);
+        let event_id = event.id.clone();
+        let event_title = event.title.clone();
+        let event_slug = event.slug.clone();
+        let polymarket_url = polymarket_event_url(event_slug.as_deref());
+        let mut legs = Vec::new();
+        for market in event.markets.unwrap_or_default() {
+            let names = market.outcomes.as_deref().unwrap_or_default();
+            let tokens = market.clob_token_ids.as_deref().unwrap_or_default();
+            let yes_index = names
+                .iter()
+                .position(|name| name.eq_ignore_ascii_case("yes"));
+            let outcome = yes_index.and_then(|index| names.get(index)).cloned();
+            let token_id = yes_index
+                .and_then(|index| tokens.get(index))
+                .map(ToString::to_string);
+            let leg = EventConsistencyLeg {
+                market_id: market.id.clone(),
+                question: market.question.clone(),
+                market_slug: market.slug.clone(),
+                polymarket_url: polymarket_url.clone(),
+                outcome,
+                token_id: token_id.clone(),
+                best_bid: None,
+                best_ask: None,
+                top_bid_size: None,
+                top_ask_size: None,
+                book_timestamp: None,
+                error: None,
+            };
+            legs.push(leg);
+        }
+        if explicit_negative_risk {
+            let mut indexed_legs = futures::stream::iter(legs.into_iter().enumerate())
+                .map(|(index, mut leg)| async move {
+                    if let Some(token_id) = leg.token_id.clone() {
+                        match self.get_order_book(token_id, Some(1)).await {
+                            Ok(book) => {
+                                leg.best_bid = book.summary.best_bid;
+                                leg.best_ask = book.summary.best_ask;
+                                leg.top_bid_size =
+                                    book.bids.first().map(|level| level.size.clone());
+                                leg.top_ask_size =
+                                    book.asks.first().map(|level| level.size.clone());
+                                leg.book_timestamp = Some(book.summary.timestamp);
+                            }
+                            Err(error) => leg.error = Some(error.to_string()),
+                        }
+                    } else {
+                        leg.error = Some("market has no explicit Yes outcome token".to_owned());
+                    }
+                    (index, leg)
+                })
+                .buffer_unordered(8)
+                .collect::<Vec<_>>()
+                .await;
+            indexed_legs.sort_by_key(|(index, _)| *index);
+            legs = indexed_legs.into_iter().map(|(_, leg)| leg).collect();
+        }
+        let eligible_for_basket_math = explicit_negative_risk
+            && legs.len() >= 2
+            && legs
+                .iter()
+                .all(|leg| leg.error.is_none() && leg.token_id.is_some());
+        let best_ask_sum = eligible_for_basket_math
+            .then(|| decimal_sum(legs.iter().map(|leg| leg.best_ask.as_deref())))
+            .flatten();
+        let best_bid_sum = eligible_for_basket_math
+            .then(|| decimal_sum(legs.iter().map(|leg| leg.best_bid.as_deref())))
+            .flatten();
+        let buy_capacity = eligible_for_basket_math
+            .then(|| decimal_min(legs.iter().map(|leg| leg.top_ask_size.as_deref())))
+            .flatten();
+        let sell_capacity = eligible_for_basket_math
+            .then(|| decimal_min(legs.iter().map(|leg| leg.top_bid_size.as_deref())))
+            .flatten();
+        let as_of_ms = now_ms();
+        Ok(EventConsistencyOutput {
+            as_of_ms,
+            event_id: event_id.clone(),
+            event_title,
+            event_slug,
+            polymarket_url,
+            explicit_negative_risk,
+            eligible_for_basket_math,
+            legs,
+            best_ask_sum: best_ask_sum.map(|value| value.to_string()),
+            buy_all_gross_edge_per_basket: best_ask_sum
+                .map(|value| (Decimal::ONE - value).to_string()),
+            buy_all_top_level_capacity: buy_capacity.map(|value| value.to_string()),
+            best_bid_sum: best_bid_sum.map(|value| value.to_string()),
+            sell_all_gross_edge_per_basket: best_bid_sum
+                .map(|value| (value - Decimal::ONE).to_string()),
+            sell_all_top_level_capacity: sell_capacity.map(|value| value.to_string()),
+            sources: vec![
+                SourceReference {
+                    name: "Polymarket Gamma API".to_owned(),
+                    url: format!("{GAMMA_ENDPOINT}/events/{event_id}"),
+                    scope: "explicit negative-risk event membership and outcome-token mappings"
+                        .to_owned(),
+                    retrieved_at_ms: as_of_ms,
+                },
+                SourceReference {
+                    name: "Polymarket CLOB V2".to_owned(),
+                    url: CLOB_V2_ENDPOINT.to_owned(),
+                    scope: "current executable top-of-book prices and sizes".to_owned(),
+                    retrieved_at_ms: as_of_ms,
+                },
+            ],
+            methodology: "Only events explicitly marked negative-risk by Gamma are treated as mutually exclusive/exhaustive baskets. The tool sums current executable Yes asks or bids and takes the smallest displayed top-level size across legs."
+                .to_owned(),
+            limitations: vec![
+                "Gross edges exclude fees, latency, partial fills beyond displayed top-level capacity, and book changes between requests.".to_owned(),
+                "A positive displayed edge is not a guaranteed executable arbitrage.".to_owned(),
+                "No semantic relationship is inferred for events lacking explicit negative-risk metadata.".to_owned(),
+            ],
+        })
+    }
+
     async fn enrich_market(&self, market: Market) -> Result<MarketDetail, AppError> {
         let token_ids = market.clob_token_ids.clone().unwrap_or_default();
         let books = if market.enable_order_book.unwrap_or(false) && !market.closed.unwrap_or(false)
@@ -190,13 +546,14 @@ impl App {
         input: ListMarketsInput,
     ) -> Result<ListMarketsOutput, AppError> {
         let limit = input.limit.unwrap_or(25).clamp(1, 100);
-        let offset = i32::try_from(input.offset.unwrap_or(0))
-            .map_err(|_| AppError::InvalidInput("offset is too large".to_owned()))?;
+        let market_offset = input.offset.unwrap_or(0).min(10_000) as usize;
         let requested_sort = input.sort_by.unwrap_or_else(|| "volume_24h".to_owned());
         let sort_by = match requested_sort.as_str() {
             "volume_24h" | "volume24hr" => "volume24hr",
-            "volume" => "volume",
-            "liquidity" => "liquidity",
+            "volume_7d" | "volume1wk" => "volume1wk",
+            "volume_30d" | "volume1mo" => "volume1mo",
+            "volume" | "volumeNum" => "volumeNum",
+            "liquidity" | "liquidityNum" => "liquidityNum",
             "start_date" | "startDate" => "startDate",
             "end_date" | "endDate" => "endDate",
             _ => {
@@ -209,6 +566,10 @@ impl App {
             .tag_slug
             .map(|value| validate_nonempty("tag_slug", value))
             .transpose()?;
+        let tag_id = match tag_slug {
+            Some(slug) => Some(self.client.tag_id_by_slug(&slug).await?),
+            None => None,
+        };
         let min_liquidity = input
             .min_liquidity
             .as_deref()
@@ -219,30 +580,185 @@ impl App {
             .as_deref()
             .map(|value| parse_decimal("min_volume", value))
             .transpose()?;
-        let request = EventsRequest::builder()
-            .limit(i32::from(limit))
-            .offset(offset)
-            .order(vec![sort_by.to_owned()])
-            .ascending(input.ascending.unwrap_or(false))
-            .active(true)
-            .closed(false)
-            .maybe_tag_slug(tag_slug)
-            .maybe_featured(input.featured)
-            .maybe_liquidity_min(min_liquidity)
-            .maybe_volume_min(min_volume)
-            .build();
-        let events = self.client.events(&request).await?;
-        let markets = events
-            .iter()
-            .flat_map(market_summaries)
-            .filter(|market| {
+        let end_after = input
+            .end_after
+            .as_deref()
+            .map(|value| parse_rfc3339("end_after", value))
+            .transpose()?;
+        let end_before = input
+            .end_before
+            .as_deref()
+            .map(|value| parse_rfc3339("end_before", value))
+            .transpose()?;
+        if matches!((end_after, end_before), (Some(start), Some(end)) if start > end) {
+            return Err(AppError::InvalidInput(
+                "end_after must not be later than end_before".to_owned(),
+            ));
+        }
+
+        if input.featured == Some(true) {
+            return self
+                .list_featured_markets(
+                    limit,
+                    market_offset,
+                    sort_by,
+                    input.ascending.unwrap_or(false),
+                    tag_id,
+                    min_liquidity,
+                    min_volume,
+                    end_after,
+                    end_before,
+                )
+                .await;
+        }
+
+        // Gamma's event endpoint sorts and paginates events, not their nested markets.
+        // Walk the directly sorted market endpoint from the beginning so `offset` applies
+        // after active/order-accepting filters and adjacent pages cannot overlap.
+        const PAGE_SIZE: i32 = 100;
+        let target = market_offset.saturating_add(usize::from(limit));
+        let ascending = input.ascending.unwrap_or(false);
+        let mut upstream_offset = 0_i32;
+        let mut eligible = Vec::with_capacity(target.min(1_000));
+        while eligible.len() < target && upstream_offset <= 10_000 {
+            let request = MarketsRequest::builder()
+                .limit(PAGE_SIZE)
+                .offset(upstream_offset)
+                .order(sort_by.to_owned())
+                .ascending(ascending)
+                .closed(false)
+                .include_tag(true)
+                .maybe_tag_id(tag_id.clone())
+                .maybe_liquidity_num_min(min_liquidity)
+                .maybe_volume_num_min(min_volume)
+                .maybe_end_date_min(end_after)
+                .maybe_end_date_max(end_before)
+                .build();
+            let page = self.client.markets(&request).await?;
+            let page_len = page.len();
+            eligible.extend(page.into_iter().filter(|market| {
                 market.active == Some(true)
                     && market.closed != Some(true)
                     && market.accepting_orders == Some(true)
-            })
+                    && (input.featured != Some(true) || market.featured == Some(true))
+            }));
+            if page_len < PAGE_SIZE as usize {
+                break;
+            }
+            upstream_offset += PAGE_SIZE;
+        }
+
+        let markets = eligible
+            .into_iter()
+            .skip(market_offset)
             .take(usize::from(limit))
+            .map(|market| market_summary(&market, market.events.as_deref().and_then(|v| v.first())))
             .collect::<Vec<_>>();
         Ok(ListMarketsOutput {
+            as_of_ms: now_ms(),
+            count: markets.len(),
+            markets,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn list_featured_markets(
+        &self,
+        limit: u16,
+        market_offset: usize,
+        sort_by: &str,
+        ascending: bool,
+        tag_id: Option<String>,
+        min_liquidity: Option<Decimal>,
+        min_volume: Option<Decimal>,
+        end_after: Option<DateTime<Utc>>,
+        end_before: Option<DateTime<Utc>>,
+    ) -> Result<ListMarketsOutput, AppError> {
+        // `featured` is an event-level Gamma filter. Applying it after walking
+        // `/markets` can cross Gamma's offset ceiling before finding a result,
+        // so fetch the intentionally small featured-event set and rank its
+        // nested markets locally.
+        const EVENT_PAGE_SIZE: i32 = 100;
+        let mut upstream_offset = 0_i32;
+        let mut candidates = Vec::<(Market, String, Option<String>, Option<String>)>::new();
+        loop {
+            let request = EventsRequest::builder()
+                .limit(EVENT_PAGE_SIZE)
+                .offset(upstream_offset)
+                .active(true)
+                .closed(false)
+                .featured(true)
+                .maybe_tag_id(tag_id.clone())
+                .build();
+            let events = self.client.events(&request).await?;
+            let page_len = events.len();
+            for event in events {
+                let event_id = event.id;
+                let event_title = event.title;
+                let event_slug = event.slug;
+                candidates.extend(
+                    event
+                        .markets
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|market| {
+                            market.active == Some(true)
+                                && market.closed != Some(true)
+                                && market.accepting_orders == Some(true)
+                                && min_liquidity.is_none_or(|minimum| {
+                                    market.liquidity_num.is_some_and(|value| value >= minimum)
+                                })
+                                && min_volume.is_none_or(|minimum| {
+                                    market.volume_num.is_some_and(|value| value >= minimum)
+                                })
+                                && end_after.is_none_or(|minimum| {
+                                    market.end_date.is_some_and(|value| value >= minimum)
+                                })
+                                && end_before.is_none_or(|maximum| {
+                                    market.end_date.is_some_and(|value| value <= maximum)
+                                })
+                        })
+                        .map(|market| {
+                            (
+                                market,
+                                event_id.clone(),
+                                event_title.clone(),
+                                event_slug.clone(),
+                            )
+                        }),
+                );
+            }
+            if page_len < EVENT_PAGE_SIZE as usize {
+                break;
+            }
+            upstream_offset += EVENT_PAGE_SIZE;
+            if upstream_offset >= 10_000 {
+                break;
+            }
+        }
+        candidates.sort_by(|(left, _, _, _), (right, _, _, _)| {
+            let ordering = compare_market_field(left, right, sort_by);
+            if ascending {
+                ordering
+            } else {
+                ordering.reverse()
+            }
+        });
+        let markets = candidates
+            .into_iter()
+            .skip(market_offset)
+            .take(usize::from(limit))
+            .map(|(market, event_id, event_title, event_slug)| {
+                let mut summary = market_summary(&market, None);
+                summary.event_id = event_id;
+                summary.event_title = event_title;
+                summary.event_slug = event_slug.clone();
+                summary.polymarket_url = polymarket_event_url(event_slug.as_deref());
+                summary
+            })
+            .collect::<Vec<_>>();
+        Ok(ListMarketsOutput {
+            as_of_ms: now_ms(),
             count: markets.len(),
             markets,
         })
@@ -351,6 +867,8 @@ impl App {
                 featured: None,
                 min_liquidity: input.min_liquidity,
                 min_volume: None,
+                end_after: None,
+                end_before: None,
                 sort_by: Some("volume_24h".to_owned()),
                 ascending: Some(false),
             })
@@ -455,6 +973,7 @@ impl App {
         start_ts: Option<i64>,
         end_ts: Option<i64>,
         fidelity: Option<u32>,
+        limit: Option<u16>,
     ) -> Result<PriceHistoryOutput, AppError> {
         let token_id = parse_u256("token_id", &token_id)?;
         let time_range = match (interval, start_ts, end_ts) {
@@ -489,9 +1008,14 @@ impl App {
                 price: point.p.to_string(),
             })
             .collect::<Vec<_>>();
+        let upstream_point_count = points.len();
+        let limit = usize::from(limit.unwrap_or(250).clamp(1, 1_000));
+        let points = downsample_points(points, limit);
         Ok(PriceHistoryOutput {
             token_id: token_id.to_string(),
+            upstream_point_count,
             point_count: points.len(),
+            truncated: points.len() < upstream_point_count,
             points,
         })
     }
@@ -579,7 +1103,7 @@ impl App {
             .fold(Decimal::ZERO, |total, item| total + item.value);
         Ok(WalletValueOutput {
             wallet: wallet.to_string(),
-            value_usdc: value.to_string(),
+            value_pusd: value.to_string(),
         })
     }
 
@@ -688,6 +1212,7 @@ impl App {
                 parsed.push(token_id);
             }
         }
+        parsed.sort_unstable();
         let initial_books = self.client.order_books(&parsed).await?;
         self.realtime.watch_markets(parsed, initial_books).await
     }
@@ -925,6 +1450,50 @@ impl App {
         self.trading.account_trades(token_id, next_cursor).await
     }
 
+    pub async fn watch_user_events(
+        &self,
+        condition_ids: Vec<String>,
+    ) -> Result<UserWatchInfo, AppError> {
+        if !(1..=50).contains(&condition_ids.len()) {
+            return Err(AppError::InvalidInput(
+                "condition_ids must contain between 1 and 50 IDs".to_owned(),
+            ));
+        }
+        let mut parsed = Vec::with_capacity(condition_ids.len());
+        for condition_id in condition_ids {
+            let condition_id = parse_b256("condition_id", &condition_id)?;
+            if !parsed.contains(&condition_id) {
+                parsed.push(condition_id);
+            }
+        }
+        self.trading.watch_user_events(parsed).await
+    }
+
+    pub async fn get_user_events(
+        &self,
+        watch_id: String,
+        after_sequence: Option<u64>,
+        limit: Option<u16>,
+    ) -> Result<UserRealtimeEventsOutput, AppError> {
+        let watch_id = validate_nonempty("watch_id", watch_id)?;
+        self.trading
+            .user_events(
+                &watch_id,
+                after_sequence.unwrap_or(0),
+                usize::from(limit.unwrap_or(100).clamp(1, 500)),
+            )
+            .await
+    }
+
+    pub async fn get_user_realtime_status(&self) -> UserRealtimeStatusOutput {
+        self.trading.user_realtime_status().await
+    }
+
+    pub async fn stop_user_watch(&self, watch_id: String) -> Result<StopWatchOutput, AppError> {
+        let watch_id = validate_nonempty("watch_id", watch_id)?;
+        Ok(self.trading.stop_user_watch(&watch_id).await)
+    }
+
     pub async fn cancel_order(
         &self,
         order_id: String,
@@ -983,6 +1552,42 @@ impl App {
     }
 }
 
+fn default_database_path() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    if let Some(root) = std::env::var_os("LOCALAPPDATA") {
+        return PathBuf::from(root)
+            .join("polymarket-mcp")
+            .join("polymarket-mcp.sqlite3");
+    }
+
+    #[cfg(target_os = "macos")]
+    if let Some(root) = std::env::var_os("HOME") {
+        return PathBuf::from(root)
+            .join("Library")
+            .join("Application Support")
+            .join("polymarket-mcp")
+            .join("polymarket-mcp.sqlite3");
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if let Some(root) = std::env::var_os("XDG_DATA_HOME") {
+            return PathBuf::from(root)
+                .join("polymarket-mcp")
+                .join("polymarket-mcp.sqlite3");
+        }
+        if let Some(root) = std::env::var_os("HOME") {
+            return PathBuf::from(root)
+                .join(".local")
+                .join("share")
+                .join("polymarket-mcp")
+                .join("polymarket-mcp.sqlite3");
+        }
+    }
+
+    PathBuf::from("polymarket-mcp.sqlite3")
+}
+
 impl Default for App {
     fn default() -> Self {
         Self::new().expect("hard-coded Polymarket endpoints must be valid URLs")
@@ -1036,6 +1641,28 @@ fn parse_address(field: &str, value: &str) -> Result<Address, AppError> {
     })
 }
 
+fn parse_rfc3339(field: &str, value: &str) -> Result<DateTime<Utc>, AppError> {
+    DateTime::parse_from_rfc3339(value.trim())
+        .map(|value| value.with_timezone(&Utc))
+        .map_err(|error| AppError::InvalidInput(format!("{field} must be RFC3339: {error}")))
+}
+
+fn cache_ttl_from_environment(default_ms: u64) -> Result<Duration, AppError> {
+    let milliseconds = std::env::var("POLYMARKET_CACHE_TTL_MS")
+        .ok()
+        .map(|value| {
+            value.parse::<u64>().map_err(|error| {
+                AppError::InvalidInput(format!(
+                    "POLYMARKET_CACHE_TTL_MS must be an integer from 0 to 60000: {error}"
+                ))
+            })
+        })
+        .transpose()?
+        .unwrap_or(default_ms)
+        .min(60_000);
+    Ok(Duration::from_millis(milliseconds))
+}
+
 fn wallet_page(limit: Option<u16>, offset: Option<u32>) -> (i32, i32) {
     (
         i32::from(limit.unwrap_or(100).clamp(1, 500)),
@@ -1057,30 +1684,129 @@ fn parse_interval(value: &str) -> Result<Interval, AppError> {
     }
 }
 
+fn downsample_points(points: Vec<PricePoint>, limit: usize) -> Vec<PricePoint> {
+    if points.len() <= limit {
+        return points;
+    }
+    if limit == 1 {
+        return points.into_iter().next_back().into_iter().collect();
+    }
+    let last = points.len() - 1;
+    (0..limit)
+        .map(|index| {
+            let source = index * last / (limit - 1);
+            points[source].clone()
+        })
+        .collect()
+}
+
+fn price_history_summary(interval: &str, points: &[PricePoint]) -> PriceHistorySummary {
+    let parsed = points
+        .iter()
+        .filter_map(|point| Decimal::from_str(&point.price).ok())
+        .collect::<Vec<_>>();
+    let minimum = parsed.iter().copied().min();
+    let maximum = parsed.iter().copied().max();
+    let first = parsed.first().copied();
+    let last = parsed.last().copied();
+    let absolute_change = first.zip(last).map(|(start, end)| end - start);
+    let percent_change = first
+        .filter(|start| !start.is_zero())
+        .zip(last)
+        .map(|(start, end)| (end - start) / start * Decimal::from(100));
+    PriceHistorySummary {
+        interval: interval.to_owned(),
+        point_count: points.len(),
+        first_timestamp: points.first().map(|point| point.timestamp),
+        last_timestamp: points.last().map(|point| point.timestamp),
+        first_price: first.map(|value| value.to_string()),
+        last_price: last.map(|value| value.to_string()),
+        minimum_price: minimum.map(|value| value.to_string()),
+        maximum_price: maximum.map(|value| value.to_string()),
+        absolute_change: absolute_change.map(|value| value.to_string()),
+        percent_change: percent_change.map(|value| value.to_string()),
+    }
+}
+
+fn decimal_sum<'a>(mut values: impl Iterator<Item = Option<&'a str>>) -> Option<Decimal> {
+    values.try_fold(Decimal::ZERO, |sum, value| {
+        Decimal::from_str(value?).ok().map(|value| sum + value)
+    })
+}
+
+fn decimal_min<'a>(mut values: impl Iterator<Item = Option<&'a str>>) -> Option<Decimal> {
+    values.try_fold(None, |minimum, value| {
+        let value = Decimal::from_str(value?).ok()?;
+        Some(Some(
+            minimum.map_or(value, |current: Decimal| current.min(value)),
+        ))
+    })?
+}
+
+fn polymarket_event_url(slug: Option<&str>) -> Option<String> {
+    slug.filter(|value| !value.is_empty())
+        .map(|slug| format!("https://polymarket.com/event/{slug}"))
+}
+
+fn gamma_market_url(market_id: &str) -> String {
+    format!("{GAMMA_ENDPOINT}/markets/{market_id}")
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis() as u64)
+}
+
 fn market_summaries(event: &Event) -> impl Iterator<Item = MarketSummary> + '_ {
     event
         .markets
         .as_deref()
         .unwrap_or_default()
         .iter()
-        .map(|market| MarketSummary {
-            event_id: event.id.clone(),
-            event_title: event.title.clone(),
-            market_id: market.id.clone(),
-            question: market.question.clone(),
-            slug: market.slug.clone(),
-            active: market.active,
-            closed: market.closed,
-            accepting_orders: market.accepting_orders,
-            end_date: market.end_date.map(|value| value.to_rfc3339()),
-            volume_24h: market.volume_24hr.map(|value| value.to_string()),
-            liquidity: market.liquidity_num.map(|value| value.to_string()),
-            outcomes: outcome_quotes(market),
-        })
+        .map(|market| market_summary(market, Some(event)))
+}
+
+fn compare_market_field(left: &Market, right: &Market, field: &str) -> std::cmp::Ordering {
+    match field {
+        "volume24hr" => left.volume_24hr.cmp(&right.volume_24hr),
+        "volume1wk" => left.volume_1wk.cmp(&right.volume_1wk),
+        "volume1mo" => left.volume_1mo.cmp(&right.volume_1mo),
+        "volumeNum" => left.volume_num.cmp(&right.volume_num),
+        "liquidityNum" => left.liquidity_num.cmp(&right.liquidity_num),
+        "startDate" => left.start_date.cmp(&right.start_date),
+        "endDate" => left.end_date.cmp(&right.end_date),
+        _ => std::cmp::Ordering::Equal,
+    }
+    .then_with(|| left.id.cmp(&right.id))
+}
+
+fn market_summary(market: &Market, event: Option<&Event>) -> MarketSummary {
+    let event_slug = event.and_then(|event| event.slug.clone());
+    MarketSummary {
+        event_id: event.map_or_else(String::new, |event| event.id.clone()),
+        event_title: event.and_then(|event| event.title.clone()),
+        event_slug: event_slug.clone(),
+        market_id: market.id.clone(),
+        question: market.question.clone(),
+        slug: market.slug.clone(),
+        active: market.active,
+        closed: market.closed,
+        accepting_orders: market.accepting_orders,
+        end_date: market.end_date.map(|value| value.to_rfc3339()),
+        volume_24h: market.volume_24hr.map(|value| value.to_string()),
+        volume_7d: market.volume_1wk.map(|value| value.to_string()),
+        volume_30d: market.volume_1mo.map(|value| value.to_string()),
+        liquidity: market.liquidity_num.map(|value| value.to_string()),
+        outcomes: outcome_quotes(market),
+        polymarket_url: polymarket_event_url(event_slug.as_deref()),
+        gamma_url: gamma_market_url(&market.id),
+    }
 }
 
 fn event_detail(event: &Event) -> EventDetail {
     EventDetail {
+        as_of_ms: now_ms(),
         event_id: event.id.clone(),
         title: event.title.clone(),
         slug: event.slug.clone(),
@@ -1106,6 +1832,8 @@ fn event_detail(event: &Event) -> EventDetail {
             })
             .collect(),
         markets: market_summaries(event).collect(),
+        polymarket_url: polymarket_event_url(event.slug.as_deref()),
+        gamma_url: format!("{GAMMA_ENDPOINT}/events/{}", event.id),
     }
 }
 
@@ -1133,11 +1861,14 @@ fn market_detail(market: &Market, books: Vec<OrderBookSummaryResponse>) -> Marke
         .map(|book| (book.asset_id.to_string(), order_book_snapshot(book)))
         .collect::<HashMap<_, _>>();
     let event = market.events.as_deref().and_then(|events| events.first());
+    let event_slug = event.and_then(|value| value.slug.clone());
 
     MarketDetail {
+        as_of_ms: now_ms(),
         market_id: market.id.clone(),
         event_id: event.map(|value| value.id.clone()),
         event_title: event.and_then(|value| value.title.clone()),
+        event_slug: event_slug.clone(),
         question: market.question.clone(),
         slug: market.slug.clone(),
         description: market.description.clone(),
@@ -1162,6 +1893,8 @@ fn market_detail(market: &Market, books: Vec<OrderBookSummaryResponse>) -> Marke
                 gamma_price: outcome.gamma_price,
             })
             .collect(),
+        polymarket_url: polymarket_event_url(event_slug.as_deref()),
+        gamma_url: gamma_market_url(&market.id),
     }
 }
 
@@ -1263,7 +1996,7 @@ fn wallet_activity(activity: Activity) -> WalletActivity {
         condition_id: activity.condition_id.map(|value| value.to_string()),
         token_id: activity.asset.map(|value| value.to_string()),
         size: activity.size.to_string(),
-        usdc_size: activity.usdc_size.to_string(),
+        pusd_size: activity.usdc_size.to_string(),
         price: activity.price.map(|value| value.to_string()),
         side: activity.side.map(|value| value.to_string()),
         title: activity.title,
@@ -1565,6 +2298,25 @@ mod tests {
     }
 
     #[test]
+    fn history_downsampling_is_bounded_and_keeps_endpoints() {
+        let points = (0..10)
+            .map(|timestamp| PricePoint {
+                timestamp,
+                price: timestamp.to_string(),
+            })
+            .collect::<Vec<_>>();
+        let sampled = downsample_points(points, 4);
+        assert_eq!(sampled.len(), 4);
+        assert_eq!(sampled.first().unwrap().timestamp, 0);
+        assert_eq!(sampled.last().unwrap().timestamp, 9);
+        assert!(
+            sampled
+                .windows(2)
+                .all(|pair| pair[0].timestamp < pair[1].timestamp)
+        );
+    }
+
+    #[test]
     fn order_book_analysis_calculates_microstructure_and_impact() {
         let book = OrderBookSummaryResponse::builder()
             .market(B256::ZERO)
@@ -1683,7 +2435,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(preview.maximum_notional_usdc, "5.0");
+        assert_eq!(preview.maximum_notional_pusd, "5.0");
         assert_eq!(preview.amount_unit, "shares");
         let approval = app
             .get_order_approval(preview.approval_id.clone())

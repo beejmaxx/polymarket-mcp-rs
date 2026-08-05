@@ -20,10 +20,11 @@ The MCP client can call every tool exposed by the selected profile. Polymarket's
 - Placement uses a fresh single-use approval, a five-minute expiry, notional caps, live market-rule checks by default, and a separate confirmation call.
 - Batch and cancellation operations require exact confirmation values. Approval transitions are written before submission.
 - Ambiguous submission failures remain `unknown`; they are not silently retried.
-- Authenticated clients use heartbeats, and placement checks geographic eligibility.
+- Account reads and user-event watches do not automatically arm cancel-on-disconnect heartbeats; placement checks geographic eligibility.
 - Exact decimals and identifiers avoid JSON precision corruption.
 - Recorder backpressure and decode failures are surfaced; replay does not claim completeness.
 - Release artifacts have checksums, SBOMs, and provenance attestations.
+- Public HTTP refuses stateful and credentialed profiles, constructs a credential-blind in-memory service, validates Host and optional Origin headers, bounds bodies and request time, and applies a basic per-peer request limit.
 
 ## Known limitations
 
@@ -32,8 +33,8 @@ The MCP client can call every tool exposed by the selected profile. Polymarket's
 - Upstream APIs, DNS, TLS roots, proxies, and the network can fail or return stale/inconsistent data. Feed age, source, and errors are exposed, but the server cannot prove real-world event truth.
 - A market order or aggressive limit order can fill immediately. Preview is policy validation, not a profit or execution guarantee.
 - GitHub-hosted binaries are not currently platform code-signed or Apple-notarized. Verify SHA-256 checksums and GitHub attestations.
-- The server is designed for local stdio. It does not add authentication suitable for an Internet-facing deployment.
+- The public HTTP profile has no user identity or private data, so its rate limiter is abuse resistance rather than authentication. Deploy behind managed TLS and edge protection; add OAuth/authorization before adding any user-specific capability.
 
 ## Recommended deployment
 
-Use the `research` profile for normal use. If trading is required, create a dedicated wallet, keep the order cap low, protect the database, avoid shell history for secrets, and keep confirmations enabled in the MCP host. Stop the server and rotate the key if credential exposure is suspected.
+Use the `research` profile over local stdio for normal local use. Use only `chatgpt` or `core` for public HTTP and follow [DEPLOYMENT.md](DEPLOYMENT.md). If trading is required, create a dedicated wallet, keep the order cap low, protect the database, avoid shell history for secrets, and keep confirmations enabled in the MCP host. Stop the server and rotate the key if credential exposure is suspected.

@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: polymarket-mcp
+    runtime: docker
+    plan: starter
+    healthCheckPath: /healthz
+    envVars:
+      - key: POLYMARKET_CACHE_TTL_MS
+        value: "2000"
+      - key: POLYMARKET_HTTP_RATE_LIMIT_PER_MINUTE
+        value: "120"
+      - key: POLYMARKET_HTTP_TIMEOUT_SECONDS
+        value: "60"

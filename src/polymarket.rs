@@ -22,7 +22,7 @@ use polymarket_client_sdk_v2::{
         types::{
             request::{
                 EventByIdRequest, EventBySlugRequest, EventsRequest, MarketByIdRequest,
-                MarketBySlugRequest, MarketsRequest, SearchRequest,
+                MarketBySlugRequest, MarketsRequest, SearchRequest, TagBySlugRequest,
             },
             response::{Event, Market, SearchResults},
         },
@@ -136,6 +136,19 @@ impl PolymarketClient {
 
     pub async fn events(&self, request: &EventsRequest) -> Result<Vec<Event>, AppError> {
         self.gamma.events(request).await.map_err(gamma_error)
+    }
+
+    pub async fn markets(&self, request: &MarketsRequest) -> Result<Vec<Market>, AppError> {
+        self.gamma.markets(request).await.map_err(gamma_error)
+    }
+
+    pub async fn tag_id_by_slug(&self, slug: &str) -> Result<String, AppError> {
+        let request = TagBySlugRequest::builder().slug(slug).build();
+        self.gamma
+            .tag_by_slug(&request)
+            .await
+            .map(|tag| tag.id)
+            .map_err(gamma_error)
     }
 
     pub async fn event_by_id(&self, event_id: &str) -> Result<Event, AppError> {

@@ -1,0 +1,11 @@
+analyze_event_consistency
+analyze_order_book
+compare_markets
+get_event
+get_market_brief
+get_price_history
+get_wallet_summary
+list_markets
+scan_market_microstructure
+search_markets
+simulate_order

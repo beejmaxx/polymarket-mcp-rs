@@ -1,4 +1,6 @@
 /target/
+/artifacts/
+__pycache__/
 .DS_Store
 .env
 *.sqlite3

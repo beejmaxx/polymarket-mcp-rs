@@ -55,6 +55,31 @@ async fn compiled_stdio_binary_serves_live_structured_tools() {
     assert_eq!(search.is_error, Some(false));
     let search = search.structured_content.expect("typed search response");
     assert!(search["count"].as_u64().unwrap_or_default() > 0);
+    let market_id = search["markets"][0]["market_id"]
+        .as_str()
+        .expect("search market ID");
+    let brief = client
+        .peer()
+        .call_tool(
+            CallToolRequestParams::new("get_market_brief").with_arguments(
+                serde_json::from_value(json!({
+                    "market_id": market_id,
+                    "sample_shares": "10",
+                    "history_limit": 10
+                }))
+                .unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(brief.is_error, Some(false));
+    let brief = brief.structured_content.expect("typed market brief");
+    assert_eq!(brief["market"]["market_id"], market_id);
+    assert!(
+        brief["sources"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty())
+    );
 
     let scan = client
         .peer()
@@ -85,11 +110,66 @@ async fn discovery_books_history_and_holders_work_in_production() {
             featured: None,
             min_liquidity: Some("1000".to_owned()),
             min_volume: None,
+            end_after: None,
+            end_before: None,
             sort_by: Some("volume_24h".to_owned()),
             ascending: Some(false),
         })
         .await
         .unwrap();
+    assert_eq!(listed.count, listed.markets.len());
+    assert!(listed.markets.windows(2).all(|markets| {
+        let left = markets[0]
+            .volume_24h
+            .as_deref()
+            .and_then(|value| value.parse::<f64>().ok());
+        let right = markets[1]
+            .volume_24h
+            .as_deref()
+            .and_then(|value| value.parse::<f64>().ok());
+        match (left, right) {
+            (Some(left), Some(right)) => left >= right,
+            (Some(_), None) | (None, None) => true,
+            (None, Some(_)) => false,
+        }
+    }));
+    let featured = app
+        .list_markets(ListMarketsInput {
+            limit: Some(5),
+            offset: None,
+            tag_slug: None,
+            featured: Some(true),
+            min_liquidity: None,
+            min_volume: None,
+            end_after: None,
+            end_before: None,
+            sort_by: Some("volume_24h".to_owned()),
+            ascending: Some(false),
+        })
+        .await
+        .unwrap();
+    assert_eq!(featured.count, featured.markets.len());
+    let second_page = app
+        .list_markets(ListMarketsInput {
+            limit: Some(10),
+            offset: Some(10),
+            tag_slug: None,
+            featured: None,
+            min_liquidity: Some("1000".to_owned()),
+            min_volume: None,
+            end_after: None,
+            end_before: None,
+            sort_by: Some("volume_24h".to_owned()),
+            ascending: Some(false),
+        })
+        .await
+        .unwrap();
+    assert!(listed.markets.iter().all(|left| {
+        second_page
+            .markets
+            .iter()
+            .all(|right| left.market_id != right.market_id)
+    }));
     let summary = listed
         .markets
         .iter()
@@ -101,6 +181,14 @@ async fn discovery_books_history_and_holders_work_in_production() {
         .await
         .unwrap();
     assert_eq!(event.event_id, summary.event_id);
+    let consistency = app
+        .analyze_event_consistency(polymarket_mcp_rs::types::AnalyzeEventConsistencyInput {
+            event_id: Some(summary.event_id.clone()),
+            slug: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(consistency.event_id, summary.event_id);
 
     let mut market = None;
     for candidate in &listed.markets {
@@ -153,10 +241,18 @@ async fn discovery_books_history_and_holders_work_in_production() {
     assert!(scan.outcome_book_count > 0);
 
     let history = app
-        .get_price_history(token_id.clone(), Some("1d".to_owned()), None, None, Some(5))
+        .get_price_history(
+            token_id.clone(),
+            Some("1d".to_owned()),
+            None,
+            None,
+            Some(5),
+            Some(100),
+        )
         .await
         .unwrap();
     assert!(!history.points.is_empty());
+    assert!(history.points.len() <= 100);
 
     let watch = app.watch_markets(vec![token_id]).await.unwrap();
     let mut snapshot = app
@@ -245,6 +341,15 @@ async fn discovery_books_history_and_holders_work_in_production() {
             assert_eq!(activity.wallet, wallet);
             let risk = app.analyze_wallet_risk(wallet.clone()).await.unwrap();
             assert_eq!(risk.wallet, wallet);
+            let summary = app
+                .get_wallet_summary(polymarket_mcp_rs::types::WalletSummaryInput {
+                    wallet: wallet.clone(),
+                    recent_limit: Some(3),
+                })
+                .await
+                .unwrap();
+            assert_eq!(summary.wallet, wallet);
+            assert!(!summary.sources.is_empty());
         }
     }
 }

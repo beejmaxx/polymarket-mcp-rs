@@ -6,15 +6,17 @@ not a claim that every Python implementation has the same behavior.
 
 ## Test method
 
-On 2026-08-04, both compiled servers were launched as child processes and exercised through their real stdio MCP transports. Both negotiated MCP protocol `2025-11-25`. The Python server ran in demo mode with no credentials; the Rust server ran read-only with its complete tool catalog for the original parity count. The current Rust default is the narrower `research` profile. The comparison called discovery, market detail, and order-book tools, then repeated the book and spread checks against the same live market and outcome token.
+On 2026-08-04, both compiled servers were launched as child processes and exercised through their real stdio MCP transports. Both negotiated MCP protocol `2025-11-25`. The Python server ran in demo mode with no credentials; the Rust server ran read-only with its complete tool catalog. The current Rust default is the narrower `research` profile. The comparison called discovery, market detail, and order-book tools, then repeated the book and spread checks against the same live market and outcome token.
 
-The Rust repository also contains automated tests for its compiled stdio binary. The ignored production suite calls both `search_markets` and `scan_market_microstructure` through MCP rather than bypassing the protocol layer.
+On 2026-08-05, the repeatable `scripts/parity_harness.py` audit mapped all 25 Python demo tools, exercised 20 semantic capability groups through both real MCP transports, and finished with 19 passes, one Python implementation defect, and zero Rust failures. The defect was the Python server advertising realtime tools whose dispatcher calls a nonexistent `realtime.handle_tool`. Authenticated trading was excluded from both runs.
+
+The Rust repository also contains automated tests for its compiled stdio binary. The ignored production suite calls both `search_markets` and `scan_market_microstructure` through MCP rather than bypassing the protocol layer. See [the live audit summary](PARITY_LIVE.md) and rerun the harness to generate full JSON/Markdown evidence locally.
 
 ## Observed results
 
 | Area | Python server | Rust server |
 |---|---|---|
-| Tool listing | 25 tools in demo mode | 27 default research tools; 39 in `all`, with mutation separately disabled unless configured |
+| Tool listing | 25 tools in demo mode | 11 hosted, 30 default research, and 46 in `all`; mutation remains separately disabled unless configured |
 | Successful result shape | JSON encoded inside text content | Typed `structuredContent` plus generated input/output schemas |
 | Tool failures | JSON `{success: false}` returned as ordinary text content | MCP `isError=true` with stable `code`, message, and retryability |
 | Financial values | JSON floating-point numbers | Exact decimal strings |
@@ -24,6 +26,8 @@ The Rust repository also contains automated tests for its compiled stdio binary.
 | Book metadata | Local response-construction timestamp | Upstream timestamp, hash, tick size, minimum order size, last trade, level counts, spread, and midpoint |
 | Derived analysis | Separate price/spread and heuristic recommendation tools | Inspectable microprice, imbalance, depth, near-touch liquidity, and fill-impact calculations |
 | Realtime persistence | In-memory subscriptions | Reconstructed local books plus SQLite book/event recording and deterministic replay |
+| Answer-ready response | Requires several raw/convenience calls and model-side joining | Joined market/wallet research with source URLs, timestamps, and limitations |
+| Hosted clients | Local stdio surface | Compact credential-blind profile, Streamable HTTP, operations endpoints, and optional portable MCP Apps card |
 
 ## Same-token correctness check
 
@@ -58,10 +62,10 @@ The Rust `analyze_order_book` result tied its calculations to the same upstream 
 
 - The Python raw Gamma response exposes more upstream fields immediately. The Rust contract intentionally exposes fewer stable fields; adding a field requires an explicit schema decision.
 - The servers chose different first search results because Rust sorts matches by trailing 24-hour volume while Python preserves the public-search response order. The same-token check avoids treating that ranking choice as a data discrepancy.
-- The Python websocket startup timed out in this machine's proxied network setup. The Rust live websocket suite passed through its explicit SOCKS5 configuration. That is an environment-specific result, though explicit proxy support is a real Rust-server capability.
+- Direct HTTP and stdio MCP production calls pass without a proxy. This machine's direct outbound market WebSocket remained in `Connecting`; the same test passes through the server's optional SOCKS5 setting. That routing limitation is environment-specific, and a proxy is not a normal deployment requirement.
 - Live books can change between sequential calls. The comparison uses executable ordering and sign invariants, and records timestamps, rather than expecting sizes to match tick-for-tick.
 - Authenticated trading was intentionally excluded. No `.env` credentials were loaded or used.
 
 ## Conclusion
 
-The Rust server already replaces the Python server's useful public-data surface while improving the MCP contract, numeric fidelity, book correctness, process packaging, and realtime recording model. The strongest differentiator is not the language itself: it is that the Rust server turns volatile upstream payloads into explicit, testable market-data semantics.
+The Rust server replaces the Python server's useful non-trading surface while improving the MCP contract, numeric fidelity, book correctness, source attribution, process packaging, hosted-client boundary, and realtime recording model. The strongest differentiator is not the language itself: it is that the Rust server turns volatile upstream payloads into explicit, testable market-data semantics.

@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Polymarket market brief</title>
+  <style>
+    :root { color-scheme: light dark; font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; color: var(--color-text-primary, #171717); background: transparent; }
+    main { padding: 14px; display: grid; gap: 12px; }
+    .eyebrow { color: var(--color-text-secondary, #666); font-size: 12px; font-weight: 650; letter-spacing: .04em; text-transform: uppercase; }
+    h1 { font-size: 18px; line-height: 1.28; margin: 3px 0 0; }
+    .meta, .sources { display: flex; flex-wrap: wrap; gap: 6px 14px; color: var(--color-text-secondary, #666); font-size: 12px; }
+    .outcomes { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 8px; }
+    .outcome { border: 1px solid var(--color-border-secondary, #ddd); border-radius: 12px; padding: 10px; min-width: 0; }
+    .row { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+    .name { font-weight: 700; overflow-wrap: anywhere; }
+    .price { font-size: 19px; font-weight: 750; font-variant-numeric: tabular-nums; }
+    dl { display: grid; grid-template-columns: auto 1fr; gap: 4px 10px; margin: 9px 0 0; font-size: 12px; }
+    dt { color: var(--color-text-secondary, #666); }
+    dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+    .warning { border-left: 3px solid #d18b00; padding-left: 9px; color: var(--color-text-secondary, #666); font-size: 12px; }
+    a { color: var(--color-text-link, #1264a3); text-underline-offset: 2px; }
+    .empty { color: var(--color-text-secondary, #666); padding: 8px 0; }
+    @media (prefers-color-scheme: dark) {
+      body { color: var(--color-text-primary, #f2f2f2); }
+      .outcome { border-color: var(--color-border-secondary, #444); }
+      a { color: var(--color-text-link, #73b7ff); }
+    }
+  </style>
+</head>
+<body>
+  <main id="root" aria-live="polite"><div class="empty">Loading market brief…</div></main>
+  <script>
+    (() => {
+      const root = document.getElementById("root");
+      const text = (value, fallback = "—") => value === null || value === undefined || value === "" ? fallback : String(value);
+      const money = value => {
+        const number = Number(value);
+        return Number.isFinite(number) ? new Intl.NumberFormat(document.documentElement.lang || "en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 }).format(number) : text(value);
+      };
+      const percent = value => {
+        const number = Number(value);
+        return Number.isFinite(number) ? `${(number * 100).toFixed(number < .01 ? 2 : 1)}%` : text(value);
+      };
+      const node = (tag, className, content) => {
+        const element = document.createElement(tag);
+        if (className) element.className = className;
+        if (content !== undefined) element.textContent = content;
+        return element;
+      };
+      const detail = (list, label, value) => {
+        list.append(node("dt", "", label), node("dd", "", text(value)));
+      };
+
+      function render(data) {
+        if (!data || !data.market) return;
+        root.replaceChildren();
+        const header = node("header");
+        header.append(node("div", "eyebrow", "Live Polymarket brief"));
+        header.append(node("h1", "", text(data.market.question, "Market")));
+        const meta = node("div", "meta");
+        meta.append(node("span", "", `24h volume ${money(data.market.volume_24h)}`));
+        meta.append(node("span", "", `Liquidity ${money(data.market.liquidity)}`));
+        if (data.as_of_ms) meta.append(node("span", "", `As of ${new Date(data.as_of_ms).toLocaleString()}`));
+        header.append(meta);
+        root.append(header);
+
+        const outcomes = node("section", "outcomes");
+        for (const item of data.outcome_research || []) {
+          const card = node("article", "outcome");
+          const top = node("div", "row");
+          top.append(node("span", "name", text(item.outcome, "Outcome")));
+          top.append(node("span", "price", percent(item.gamma_price)));
+          card.append(top);
+          const details = node("dl");
+          detail(details, "Best bid", item.analysis?.best_bid ? percent(item.analysis.best_bid) : null);
+          detail(details, "Best ask", item.analysis?.best_ask ? percent(item.analysis.best_ask) : null);
+          detail(details, "Spread", item.analysis?.spread ? percent(item.analysis.spread) : null);
+          detail(details, "History", item.history?.absolute_change ? `${Number(item.history.absolute_change) >= 0 ? "+" : ""}${percent(item.history.absolute_change)}` : null);
+          detail(details, "Sample buy", item.analysis?.sample_buy?.average_price ? percent(item.analysis.sample_buy.average_price) : null);
+          card.append(details);
+          if (item.errors?.length) card.append(node("div", "warning", item.errors.join(" ")));
+          outcomes.append(card);
+        }
+        root.append(outcomes);
+
+        if (data.limitations?.length) root.append(node("div", "warning", data.limitations[0]));
+        const sources = node("footer", "sources");
+        sources.append(node("span", "", "Sources:"));
+        for (const source of data.sources || []) {
+          const link = node("a", "", text(source.name, "source"));
+          link.href = source.url;
+          link.target = "_blank";
+          link.rel = "noopener noreferrer";
+          sources.append(link);
+        }
+        root.append(sources);
+      }
+
+      window.addEventListener("message", event => {
+        if (event.source !== window.parent) return;
+        const message = event.data;
+        if (message?.jsonrpc !== "2.0" || message.method !== "ui/notifications/tool-result") return;
+        render(message.params?.structuredContent);
+      }, { passive: true });
+
+      if (window.openai?.toolOutput) render(window.openai.toolOutput);
+    })();
+  </script>
+</body>
+</html>
